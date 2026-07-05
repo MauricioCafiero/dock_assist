@@ -1,0 +1,11 @@
+ollama
+rdkit
+scipy
+scikit-learn
+pubchempy
+pandas
+requests
+rcsb-api
+dockstring
+openbabel-wheel
+rich
