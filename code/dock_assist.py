@@ -3,27 +3,44 @@ import glob
 from PIL import Image
 from collections import Counter
 from typing import Annotated, TypedDict
-import time, sys
+import time, sys, argparse
 from ollama import Client as ollama_client
 from rich.console import Console
 from rich.markdown import Markdown
 
-from modrag_protein_functions import get_protein_from_pdb, find_PDBID_node, smiles_node
+from modrag_protein_functions import get_protein_from_pdb, find_PDBID_node, smiles_node, check_nearby_molecules
 from vina_dock import blind_dock_agent
 console = Console(width=80)
 import modrag_protein_functions
+import vina_dock
 
 
-# get the print flag from the command line arguments, if they exist, otherwise set it to False
-if len(sys.argv) > 1 and sys.argv[1] == '--print':
-    print_flag = True
-else:
-    print_flag = False
+# Parse command-line arguments.
+#   --print  : verbose mode (prints thinking, tool calls, and results)
+#   --model  : override the Ollama chat model (defaults to models[0] below)
+parser = argparse.ArgumentParser(
+    description='MoDrAg docking assistant — a CLI for drug discovery and molecular design.')
+parser.add_argument('--print', action='store_true',
+                    help='verbose mode: print thinking, tool calls, and results')
+parser.add_argument('--model', default=None,
+                    help='Ollama chat model to use (e.g. "glm-5.2"); '
+                         'defaults to the first entry in the models list')
+args, _ = parser.parse_known_args()
+print_flag = args.print
+model_override = args.model
+
+# Proximity fallback for blind docking: when True, blind_dock docks the top-2
+# detected pockets and, if the best-score pocket's pose is NOT near a
+# co-crystallized ligand, switches to the other pocket when it IS near one
+# (proximity preferred over Vina score). Flip to True to retry the second-best
+# pocket when the first lands off-target from a known ligand.
+use_second_pocket_fallback = True
 
 # Set print_flag in all imported modules
 modrag_protein_functions.print_flag = print_flag
+vina_dock.FALLBACK_TO_SECOND_POCKET = use_second_pocket_fallback
 
-tools = [find_PDBID_node, get_protein_from_pdb, smiles_node, blind_dock_agent]
+tools = [find_PDBID_node, get_protein_from_pdb, smiles_node, check_nearby_molecules, blind_dock_agent]
 
 #get ket from shell variable $OLLAMA_API_KEY
 ollama_key = os.getenv('OLLAMA_API_KEY')
@@ -39,6 +56,11 @@ models = [
 ]
 
 model = models[0] # default model to use for chat
+# Allow the model to be overridden from the command line (--model <name>).
+# If the override isn't in the curated list above, use it as-is so any model
+# available on the Ollama host can be selected without editing this file.
+if model_override:
+    model = model_override
 
 sys_message = f'''
 You are a drug discovery assistant named Modrag-dock. You have access to the 
@@ -46,8 +68,10 @@ following tools: {', '.join([tool.__name__ for tool in tools])}. Your job is
 to find and retreive pdb files for proteins of interest and then perform docking simulations. 
 You will be given a protein name and you will search the protein databank for PDB IDs that match 
 along with the entry titles. You will pick the most relevant PDB ID and use 
-it to retreive the pdb file for that protein. You will then dock any requested ligands to the 
-protein and return the results.
+it to retreive the pdb file for that protein. You should aim for a PDB structure with a ligand (preferably an inhibitor)
+bound in the active site, if possible. You will then dock any requested ligands to the protein and return 
+the results. If the PDB structure has a ligand bound, you should also check for nearby molecules in the 
+PDB file (using the tool) to assess if the docking has located the correct binding site.
 '''
 
 global messages
@@ -76,7 +100,8 @@ def chat_turn(prompt: str):
     'find_PDBID_node': find_PDBID_node,
     'get_protein_from_pdb': get_protein_from_pdb,
     'smiles_node': smiles_node,
-    'blind_dock_agent': blind_dock_agent
+    'blind_dock_agent': blind_dock_agent,
+    'check_nearby_molecules': check_nearby_molecules
   }
 
   messages.append({'role': 'user', 'content': prompt})
@@ -85,7 +110,7 @@ def chat_turn(prompt: str):
       response = client.chat(
           model=model,
           messages=messages,
-          tools=[find_PDBID_node, get_protein_from_pdb, smiles_node, blind_dock_agent],
+          tools=[find_PDBID_node, get_protein_from_pdb, smiles_node, check_nearby_molecules, blind_dock_agent],
           think=True,
       )
       messages.append(response.message)

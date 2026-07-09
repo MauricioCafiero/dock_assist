@@ -26,6 +26,11 @@ where it is), and dock the requested ligands with AutoDock Vina.
   the best-scoring pose is written out as an `.sdf` for inspection in PyMOL.
 - **Caching.** Receptors already present in `pdb_files/` (matched by PDB ID) are
   reused instead of being re-downloaded.
+- **Proximity-fallback-to-second-pocket (opt-in).** When enabled, blind docking
+  checks the top-2 pockets and, if the best-score pocket's pose does *not* sit
+  near a co-crystallized ligand, switches to the second-best pocket when it
+  *does* — preferring **proximity to a known ligand over Vina score**. See
+  [Proximity fallback](#proximity-fallback-to-second-pocket-opt-in).
 
 ---
 
@@ -68,7 +73,9 @@ You also need:
   must be on your PATH** — install it via Homebrew (`brew install open-babel`)
   or your package manager.
 - **An Ollama API key** in the `OLLAMA_API_KEY` environment variable. The client
-  connects to `https://ollama.com`.
+  connects to `https://ollama.com`. Any Ollama account works — free accounts run
+  the default model with no extra setup; Pro accounts can select a stronger model
+  with `--model` (see [Choosing a model](#choosing-a-model)).
 - **A Vina binary.** By default `vina_dock.py` reuses the copy of AutoDock Vina
   vendored inside the `dockstring` package (no separate install needed). A
   `--vina-bin` flag is available if you want to point at a different build.
@@ -76,6 +83,9 @@ You also need:
 ---
 
 ## Usage
+
+Modrag-dock is designed to **just work out of the box**. Set your API key once,
+then run it — no other configuration required:
 
 ```bash
 export OLLAMA_API_KEY=...
@@ -100,6 +110,30 @@ PyMOL.
 Type `quit` to leave. On exit the CLI reminds you to move any `.sdf` files you
 want to keep, because **leftover `.sdf` files are deleted from `pdb_files/` at
 the start of the next run** (the `.pdb` receptors are kept).
+
+### Choosing a model
+
+The agent is powered by an Ollama-hosted model. The defaults are chosen so you
+can run without thinking about models:
+
+- **Free Ollama account → use the default.** Just run `python3 dock_assist.py`
+  with no flags. The default model (`gemma4:31b`) works out of the box and needs
+  no setup.
+- **Pro Ollama account → choose `glm-5.2`.** It reasons better through the
+  tool-calling loop. Select it from the command line:
+
+  ```bash
+  python3 dock_assist.py --model glm-5.2
+  ```
+
+The `--model` flag accepts any model name available on your Ollama host — you can
+pass any model without editing the file:
+
+```bash
+python3 dock_assist.py --model kimi-k2.7-code
+```
+
+Run `python3 dock_assist.py --help` to see all options.
 
 ### Print / debug mode
 
@@ -285,6 +319,81 @@ sieves without touching code:
 
 The validated plateau (`top_frac ∈ [0.04, 0.08]`, `min_samples ∈ [20, 40]`) is
 the safe region to experiment in.
+
+---
+
+## Proximity fallback to second pocket (opt-in)
+
+Blind docking ranks pockets by a geometry score and, by default, keeps only the
+**#1** pocket and trusts its best Vina pose. That is usually right — but not
+always. A real failure case motivated this feature: **rosuvastatin docked into
+HMGCR (PDB 1HW9)** scored a respectable **−8.0 kcal/mol**, yet the pose landed in
+a pocket that did **not** overlap the reference co-crystallized ligand
+(simvastatin) — no crystal molecule within 5.0 Å. A good score in the wrong place
+is a silent failure the agent would otherwise report as success.
+
+The proximity fallback folds the same co-crystallized-ligand proximity check that
+powers the separate `check_nearby_molecules` tool *into* the docking step itself,
+so `blind_dock` can auto-correct:
+
+1. When enabled, `blind_dock` docks the **top-2** detected pockets.
+2. It parses the receptor's `HETNAM`/`HETATM` records for co-crystallized ligand
+   coordinates (waters/ions excluded).
+3. It measures each pose's **minimum atom-to-atom distance** to every
+   co-crystallized ligand (the same 5.0 Å metric as `check_nearby_molecules`).
+4. If the **best-score** pocket's pose is **off-target** (> 5.0 Å from every
+   crystal ligand, or unreadable) and the **2nd-best** pocket's pose **is** near
+   one (≤ 5.0 Å), it **switches to the 2nd pocket** — even though its Vina score
+   is worse. **Proximity to a known ligand is preferred over Vina score.**
+5. If *neither* pose is near a ligand, or the crystal has no bound ligand, it
+   falls back to the best score (unchanged behavior).
+
+### Enabling it
+
+It is **off by default** so the agent behaves exactly as before. To turn it on,
+flip one line in `code/dock_assist.py`:
+
+```python
+use_second_pocket_fallback = False   # → True
+```
+
+This propagates to `vina_dock.FALLBACK_TO_SECOND_POCKET` (the same pattern used
+for the `--print` flag). You can also set the global directly:
+
+```python
+import vina_dock
+vina_dock.FALLBACK_TO_SECOND_POCKET = True
+```
+
+The cutoff is `NEAR_LIGAND_CUTOFF = 5.0` Å in `vina_dock.py`, mirroring
+`NEARBY_DISTANCE_CUTOFF` in `modrag_protein_functions.py` so "near a known
+ligand" means the same thing in the auto-switch and the post-hoc check tool.
+
+> **Why a global flag and not a function argument?** `blind_dock_agent`'s
+> signature is unchanged on purpose. The LLM tool-caller would otherwise
+> hallucinate the optional parameter and pass bogus values. The flag is a
+> developer toggle the model never sees in the tool schema — a developer flips
+> it in code; the agent calls the same two-argument tool either way.
+
+### What you'll see in the output
+
+When the fallback fires, the docking report gets a header line:
+
+```
+proximity fallback: enabled (2 crystal ligand occurrence(s), cutoff 5.0 A)
+```
+
+and the chosen pose's detail notes the switch, e.g.:
+
+```
+... modes; switched from pocket #1 (off-target, 12.3 A from crystal ligand) to pocket #2 (near, 3.1 A)
+```
+
+If the crystal has no co-crystallized ligand to compare against:
+
+```
+proximity fallback: enabled but no co-crystallized ligand found; falling back to best score
+```
 
 ---
 

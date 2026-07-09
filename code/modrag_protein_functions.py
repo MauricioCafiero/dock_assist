@@ -2,13 +2,19 @@ import requests
 import itertools
 import os
 import glob
+import math
 import pubchempy as pcp
 
 from rcsbapi.search import TextQuery
+from rdkit import Chem
 
 
 # Module-level print flag - set from modrag.py
 print_flag = False
+
+# Distance (Angstrom) under which a co-crystallized molecule is reported as
+# "close" to the docked ligand (minimum atom-to-atom distance).
+NEARBY_DISTANCE_CUTOFF = 5.0
 
 def smiles_node(names_list: list[str]) -> (str):
   '''
@@ -88,9 +94,9 @@ def find_PDBID_node(test_protein_list: list[str]) -> str:
         for rid in results:
           yield(rid)
 
-      take10 = itertools.islice(pdb_gen(), which_pdbs, which_pdbs+10, 1)
+      take10 = itertools.islice(pdb_gen(), which_pdbs, which_pdbs+20, 1)
 
-      pdb_string += f'10 PDBs that match the protein {test_protein} are: \n'
+      pdb_string += f'20 PDBs that match the protein {test_protein} are: \n'
       for pdb in take10:
         data = requests.get(f"https://data.rcsb.org/rest/v1/core/entry/{pdb}").json()
         title = data['struct']['title']
@@ -99,3 +105,95 @@ def find_PDBID_node(test_protein_list: list[str]) -> str:
       pdb_string += f'Failed to get PDB IDs for protein {test_protein}\n'
 
   return pdb_string
+
+def check_nearby_molecules(pdb_filepath: str, ligand_filepath: str) -> str:
+  '''
+    Checks for nearby molecules in the PDB file to asses if the docking has 
+    located the correct binding site. Should be called to verify blind docking
+    in the case where a ligand is present in the crystal structure. 
+
+    Args:
+      pdb_filepath: the path to the PDB file
+      ligand_filepath: the path to the ligand file
+    Returns:
+      nearby_molecules: a string containing the results of the check.
+  '''
+  print(f"Nearby molecules check tool")
+  print('===================================================')
+
+  with open(pdb_filepath, 'r') as pdb_file:
+      pdb_content = pdb_file.readlines()
+
+  ligand_names = {}
+  for line in pdb_content:
+    if line.startswith('HETNAM'):
+      molecule_symbol = line[11:15].strip()
+      molecule_name = line[15:70].strip()
+      if not molecule_symbol:
+        continue
+      if molecule_symbol not in ligand_names:
+        ligand_names[molecule_symbol] = molecule_name
+      elif molecule_name:
+        ligand_names[molecule_symbol] += ' ' + molecule_name
+
+  molecule_dict = {}
+  for line in pdb_content:
+    if line.startswith('HETATM'):
+      molecule_symbol = line[17:20].strip()
+      if molecule_symbol not in ligand_names:
+        continue
+      chain_id = line[21].strip()
+      occ_key = (molecule_symbol, chain_id)
+      if occ_key not in molecule_dict:
+        molecule_dict[occ_key] = {'name': ligand_names[molecule_symbol] or molecule_symbol,
+                                  'coords': []}
+      x_coord = float(line[30:38])
+      y_coord = float(line[38:46])
+      z_coord = float(line[46:54])
+      molecule_dict[occ_key]['coords'].append((x_coord, y_coord, z_coord))
+
+  ligand_atom_coords = []
+  try:
+    supplier = Chem.SDMolSupplier(ligand_filepath, removeHs=True)
+    poses = [m for m in supplier if m is not None]
+  except Exception:
+    poses = []
+  for mol in poses:
+    if not ligand_atom_coords:
+      conf = mol.GetConformer()
+      ligand_atom_coords = [(conf.GetAtomPosition(j).x,
+                             conf.GetAtomPosition(j).y,
+                             conf.GetAtomPosition(j).z) for j in range(mol.GetNumAtoms())]
+
+  nearby_molecules = f'Checked for nearby molecules in {pdb_filepath}.\n'
+  if not ligand_atom_coords:
+    nearby_molecules += 'No ligand could be read from the SDF.\n'
+  else:
+    distances = []
+    for (molecule_symbol, chain_id), info in molecule_dict.items():
+      mol_coords = info['coords']
+      if not mol_coords or not ligand_atom_coords:
+        continue
+      best = None
+      for lx, ly, lz in ligand_atom_coords:
+        for mx, my, mz in mol_coords:
+          d = math.sqrt((lx - mx) ** 2 + (ly - my) ** 2 + (lz - mz) ** 2)
+          if best is None or d < best:
+            best = d
+      distances.append((best, molecule_symbol, chain_id, info))
+    distances.sort(key=lambda d: d[0])
+
+    nearby_molecules += (f'Molecules within {NEARBY_DISTANCE_CUTOFF:.1f} A '
+                         f'of the docked ligand (min atom-to-atom distance):\n')
+    any_close = False
+    for dist, molecule_symbol, chain_id, info in distances:
+      molecule_name = info['name']
+      line = (f'  {molecule_name} ({molecule_symbol}, chain {chain_id}): '
+             f'min atom-to-atom {dist:.2f} A')
+      if dist <= NEARBY_DISTANCE_CUTOFF:
+        any_close = True
+        nearby_molecules += line + ' -- CLOSE\n'
+    if not any_close:
+      nearby_molecules += '  (none found)\n'
+
+  return nearby_molecules

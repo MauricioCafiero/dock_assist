@@ -23,6 +23,7 @@ Example:
 import argparse
 import contextlib
 import io
+import math
 import os
 import re
 import shutil
@@ -33,6 +34,21 @@ import time
 from types import SimpleNamespace
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+
+# When True, blind_dock docks the top-2 detected pockets and, if the best-score
+# pocket's pose is NOT near a co-crystallized ligand, switches to the other
+# pocket when IT is near one (proximity preferred over Vina score). Default off
+# so the agent-facing tool behaves unchanged unless a developer opts in here.
+#
+# This is a module global -- NOT a blind_dock_agent kwarg -- on purpose: the
+# LLM tool-caller would otherwise hallucinate the optional parameter (see the
+# agent-tool-signature gotcha). A developer flips this in code; the model never
+# sees it in the tool schema.
+FALLBACK_TO_SECOND_POCKET = False
+# Min atom-to-atom distance (Angstroms) for a docked pose to count as "near" a
+# co-crystallized ligand. Mirrors NEARBY_DISTANCE_CUTOFF in modrag_protein_functions
+# so "near a known ligand" means the same here and in the post-hoc check tool.
+NEAR_LIGAND_CUTOFF = 5.0
 
 
 class DockError(Exception):
@@ -287,6 +303,92 @@ def parse_vina_log(log_path):
     return affinities[0], len(affinities)
 
 
+# --- proximity fallback helpers -------------------------------------------
+# These mirror the HETNAM/HETATM scan in
+# modrag_protein_functions.check_nearby_molecules so that "near a known ligand"
+# means the same thing inside blind_dock (the fallback gate) and in the
+# separate post-hoc check tool the agent calls afterward.
+
+def _crystal_ligand_coords(pdb_path):
+    """Return a list of coordinate lists, one per co-crystallized ligand
+    occurrence in the PDB, or [] if the structure has no such ligand.
+
+    Only ligands with a HETNAM record are kept, so waters and ions (which lack
+    HETNAM entries) are excluded -- matching check_nearby_molecules. Each
+    (symbol, chain) occurrence is its own entry.
+    """
+    hetnam = set()
+    with open(pdb_path) as fh:
+        for line in fh:
+            if line.startswith("HETNAM"):
+                sym = line[11:15].strip()
+                if sym:
+                    hetnam.add(sym)
+    if not hetnam:
+        return []
+    occs = []
+    cur = None
+    cur_key = None
+    with open(pdb_path) as fh:
+        for line in fh:
+            if not line.startswith("HETATM"):
+                continue
+            sym = line[17:20].strip()
+            if sym not in hetnam:
+                continue
+            chain = line[21].strip()
+            key = (sym, chain)
+            if key != cur_key:
+                cur_key = key
+                cur = []
+                occs.append(cur)
+            try:
+                x = float(line[30:38]); y = float(line[38:46]); z = float(line[46:54])
+                cur.append((x, y, z))
+            except ValueError:
+                continue
+    return [c for c in occs if c]
+
+
+def _pose_min_distance(pdbqt_path, crystal_occs):
+    """Min atom-to-atom distance between the FIRST (best) pose in a Vina poses
+    PDBQT and any co-crystallized ligand occurrence. None if no atoms read.
+
+    Only the first MODEL is read so the gate reflects the single best pose we
+    would actually keep (the SDF stores the top poses), matching
+    check_nearby_molecules which only inspects the first SDF conformer.
+    """
+    if not crystal_occs:
+        return None
+    pose = []
+    seen_model = False
+    with open(pdbqt_path) as fh:
+        for line in fh:
+            if line.startswith("ENDMDL"):
+                break
+            if line.startswith("MODEL"):
+                if seen_model:
+                    break  # stop before the second model
+                seen_model = True
+                continue
+            if line.startswith(("ATOM", "HETATM")):
+                try:
+                    x = float(line[30:38]); y = float(line[38:46]); z = float(line[46:54])
+                    pose.append((x, y, z))
+                except ValueError:
+                    continue
+    if not pose:
+        return None
+    best = None
+    for lx, ly, lz in pose:
+        for occ in crystal_occs:
+            for mx, my, mz in occ:
+                d = math.sqrt((lx - mx) ** 2 + (ly - my) ** 2 + (lz - mz) ** 2)
+                if best is None or d < best:
+                    best = d
+    return best
+
+
 # --- agent-facing blind-docking API ----------------------------------------
 
 def blind_dock(receptor_pdb, smiles_list, npockets=1, exhaustiveness=8,
@@ -338,7 +440,9 @@ def blind_dock(receptor_pdb, smiles_list, npockets=1, exhaustiveness=8,
     print("vina_dock: blind docking...")
     print('==============================================')
 
-    smiles_list = list(smiles_list)
+    if isinstance(smiles_list, str):
+        smiles_list = [smiles_list]
+
     if not os.path.exists(receptor_pdb):
         raise DockError(f"receptor not found: {receptor_pdb}")
     require("obabel")
@@ -375,7 +479,16 @@ def blind_dock(receptor_pdb, smiles_list, npockets=1, exhaustiveness=8,
                                min_samples=blind_min_samples)
         if not pockets:
             raise DockError("no pockets detected in receptor")
+        if FALLBACK_TO_SECOND_POCKET and npockets < 2:
+            # need >=2 pockets docked so the off-target fallback has somewhere
+            # to fall back to; if fewer than 2 are detected, fallback is a no-op
+            npockets = 2
         pockets = pockets[:max(1, npockets)]
+        # Co-crystallized ligand coords (HETNAM-keyed HETATM) for the proximity
+        # fallback; empty if the structure has no known ligand to compare to,
+        # in which case the fallback silently degrades to best-score selection.
+        crystal_occs = (_crystal_ligand_coords(receptor_pdb)
+                        if FALLBACK_TO_SECOND_POCKET else [])
         box_size = [blind_box] * 3
 
         # 3) dock each ligand into the top-N pockets, keep best score
@@ -403,12 +516,37 @@ def blind_dock(receptor_pdb, smiles_list, npockets=1, exhaustiveness=8,
                     results.append((idx, smi, None, None, sdf_path,
                                     "failed", "no score parsed from any Vina log"))
                     continue
-                bj, baff, bnm, bpp = min(valid, key=lambda r: r[1])
-                convert(["obabel", "-ipdbqt", bpp, "-osdf", "-O", sdf_path,
+                # primary = best Vina affinity (the pre-fallback choice)
+                primary = min(valid, key=lambda r: r[1])
+                chosen = primary
+                detail = f"{primary[2]} modes"
+                if (FALLBACK_TO_SECOND_POCKET and crystal_occs
+                        and len(valid) > 1):
+                    pd = _pose_min_distance(primary[3], crystal_occs)
+                    if pd is None or pd > NEAR_LIGAND_CUTOFF:
+                        # best-score pocket is off-target; look for a pocket
+                        # whose pose IS near a co-crystallized ligand, and prefer
+                        # the closest (proximity over Vina score).
+                        near = []
+                        for r in valid:
+                            if r is primary:
+                                continue
+                            d = _pose_min_distance(r[3], crystal_occs)
+                            if d is not None and d <= NEAR_LIGAND_CUTOFF:
+                                near.append((d, r))
+                        if near:
+                            near.sort(key=lambda x: x[0])
+                            chosen = near[0][1]
+                            pd_s = f"{pd:.1f} A" if pd is not None else "n/a"
+                            detail = (f"{chosen[2]} modes; switched from "
+                                      f"pocket #{primary[0]} (off-target, {pd_s} "
+                                      f"from crystal ligand) to pocket "
+                                      f"#{chosen[0]} (near, {near[0][0]:.1f} A)")
+                cj, caff, cnm, cpp = chosen
+                convert(["obabel", "-ipdbqt", cpp, "-osdf", "-O", sdf_path,
                          "-l", str(n_out_poses)],
                         f"pose PDBQT->SDF (mol {idx}, top {n_out_poses})")
-                results.append((idx, smi, baff, bj, sdf_path, "ok",
-                                f"{bnm} modes"))
+                results.append((idx, smi, caff, cj, sdf_path, "ok", detail))
             except DockError as e:
                 results.append((idx, smi, None, None, sdf_path, "failed", str(e)))
             except Exception as e:  # defensive: never let one molecule kill the run
@@ -423,6 +561,14 @@ def blind_dock(receptor_pdb, smiles_list, npockets=1, exhaustiveness=8,
     lines.append(f"  receptor:     {receptor_pdb}")
     lines.append(f"  receptor PDBQT: {rec_pdbqt}")
     lines.append(f"  vina binary: {vina_bin}")
+    if FALLBACK_TO_SECOND_POCKET:
+        if crystal_occs:
+            lines.append(f"  proximity fallback: enabled "
+                         f"({len(crystal_occs)} crystal ligand occurrence(s), "
+                         f"cutoff {NEAR_LIGAND_CUTOFF:.1f} A)")
+        else:
+            lines.append("  proximity fallback: enabled but no co-crystallized "
+                         "ligand found; falling back to best score")
     lines.append(f"  pockets docked (top {len(pockets)}):")
     for i, p in enumerate(pockets):
         c = p["center"]
@@ -449,13 +595,13 @@ def blind_dock(receptor_pdb, smiles_list, npockets=1, exhaustiveness=8,
     return "\n".join(lines)
 
 
-def blind_dock_agent(receptor_pdb, smiles_list):
+def blind_dock_agent(receptor_pdb: str, smiles_list: list[str]) -> str:
     """
     Dock ligands in a protein using ligand smiles and a receptor PDB file.
 
     Args:
         receptor_pdb: path to a receptor PDB file (binding site unknown).
-        smiles_list: iterable of ligand SMILES strings.
+        smiles_list: iterable list of ligand SMILES strings.
     Returns:
         A multi-line string report (header with receptor + receptor-PDBQT path
         + pocket centers, one block per molecule with score
