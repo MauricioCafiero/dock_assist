@@ -55,6 +55,7 @@ The agent exposes four tools to the LLM:
 | `get_protein_from_pdb` | Download the `.pdb` file for a chosen PDB ID (reuses cached files). |
 | `smiles_node` | Resolve molecule names to SMILES via PubChem. |
 | `blind_dock_agent` | Detect binding pockets and dock the ligands (see below). |
+| `check_nearby_molecules` | Checks for docked ligand proximity to crystal small molecules. |
 
 ---
 
