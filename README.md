@@ -68,10 +68,10 @@ pip install -r requirements.txt
 
 You also need:
 
-- **Open Babel** (`obabel` on PATH) for PDB↔PDBQT conversion. The
-  `openbabel-wheel` package provides the Python bindings, but the **`obabel` CLI
-  must be on your PATH** — install it via Homebrew (`brew install open-babel`)
-  or your package manager.
+- **Open Babel** (`obabel` on PATH) for PDB↔PDBQT conversion. This ships with
+  the `openbabel-wheel` package — the `obabel` CLI is installed into your
+  virtualenv's `bin/` automatically by `pip install -r requirements.txt`, so no
+  separate Homebrew/system install is needed.
 - **An Ollama API key** in the `OLLAMA_API_KEY` environment variable. The client
   connects to `https://ollama.com`. Any Ollama account works — free accounts run
   the default model with no extra setup; Pro accounts can select a stronger model
@@ -418,4 +418,5 @@ pose in the receptor's binding site.
 
 `ollama`, `rdkit`, `scipy`, `scikit-learn`, `pubchempy`, `pandas`, `requests`,
 `rcsb-api`, `dockstring`, `openbabel-wheel`, `rich` — see `requirements.txt`.
-The `obabel` CLI must additionally be on your PATH.
+The `obabel` CLI comes from `openbabel-wheel` and is placed on your PATH
+automatically; no extra install step.
