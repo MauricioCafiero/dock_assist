@@ -8,8 +8,8 @@ from ollama import Client as ollama_client
 from rich.console import Console
 from rich.markdown import Markdown
 
-from modrag_protein_functions import get_protein_from_pdb, find_PDBID_node, smiles_node, check_nearby_molecules
-from vina_dock import blind_dock_agent
+from modrag_protein_functions import get_protein_from_pdb, find_PDBID_node, smiles_node, check_nearby_molecules, find_ligand_centroids
+from vina_dock import blind_dock_agent, dock_at_centroid_agent
 console = Console(width=80)
 import modrag_protein_functions
 import vina_dock
@@ -40,7 +40,8 @@ use_second_pocket_fallback = True
 modrag_protein_functions.print_flag = print_flag
 vina_dock.FALLBACK_TO_SECOND_POCKET = use_second_pocket_fallback
 
-tools = [find_PDBID_node, get_protein_from_pdb, smiles_node, check_nearby_molecules, blind_dock_agent]
+tools = [find_PDBID_node, get_protein_from_pdb, smiles_node, check_nearby_molecules,
+         find_ligand_centroids, blind_dock_agent, dock_at_centroid_agent]
 
 #get ket from shell variable $OLLAMA_API_KEY
 ollama_key = os.getenv('OLLAMA_API_KEY')
@@ -63,14 +64,24 @@ if model_override:
     model = model_override
 
 sys_message = f'''
-You are a drug discovery assistant named Modrag-dock. You have access to the 
-following tools: {', '.join([tool.__name__ for tool in tools])}. Your job is 
-to find and retreive pdb files for proteins of interest and then perform docking simulations. 
-You will be given a protein name and you will search the protein databank for PDB IDs that match 
-along with the entry titles. You will pick the most relevant PDB ID and use 
+You are a drug discovery assistant named Modrag-dock. You have access to the
+following tools: {', '.join([tool.__name__ for tool in tools])}. Your job is
+to find and retreive pdb files for proteins of interest and then perform docking simulations.
+You will be given a protein name and you will search the protein databank for PDB IDs that match
+along with the entry titles. You will pick the most relevant PDB ID and use
 it to retreive the pdb file for that protein. You should aim for a PDB structure with a ligand (preferably an inhibitor)
-bound in the active site, if possible. You will then dock any requested ligands to the protein and return 
-the results. If the PDB structure has a ligand bound, you should also check for nearby molecules in the 
+bound in the active site, if possible.
+
+For docking you have two options. Use blind_dock_agent when the binding site is
+unknown (it auto-detects pockets). When the PDB structure has a co-crystallized
+ligand (a HET small molecule) bound, prefer instead: call find_ligand_centroids
+on the receptor PDB to list each co-crystallized small molecule with its name,
+centroid coordinates and QED score, pick the most relevant one (e.g. the
+inhibitor with the best QED, or the one matching the user's intent), and call
+dock_at_centroid_agent with that molecule's centroid (center_x, center_y,
+center_z) to dock at that known site.
+
+After docking, if the PDB structure has a ligand bound, you should also check for nearby molecules in the
 PDB file (using the tool) to assess if the docking has located the correct binding site.
 '''
 
@@ -101,6 +112,8 @@ def chat_turn(prompt: str):
     'get_protein_from_pdb': get_protein_from_pdb,
     'smiles_node': smiles_node,
     'blind_dock_agent': blind_dock_agent,
+    'dock_at_centroid_agent': dock_at_centroid_agent,
+    'find_ligand_centroids': find_ligand_centroids,
     'check_nearby_molecules': check_nearby_molecules
   }
 
@@ -110,7 +123,8 @@ def chat_turn(prompt: str):
       response = client.chat(
           model=model,
           messages=messages,
-          tools=[find_PDBID_node, get_protein_from_pdb, smiles_node, check_nearby_molecules, blind_dock_agent],
+          tools=[find_PDBID_node, get_protein_from_pdb, smiles_node, check_nearby_molecules,
+                 find_ligand_centroids, blind_dock_agent, dock_at_centroid_agent],
           think=True,
       )
       messages.append(response.message)

@@ -49,6 +49,13 @@ FALLBACK_TO_SECOND_POCKET = False
 # co-crystallized ligand. Mirrors NEARBY_DISTANCE_CUTOFF in modrag_protein_functions
 # so "near a known ligand" means the same here and in the post-hoc check tool.
 NEAR_LIGAND_CUTOFF = 5.0
+# Cubic box edge length (Angstroms) used by dock_at_centroid / the agent-facing
+# dock_at_centroid_agent. A module global -- NOT an agent-facing kwarg -- on
+# purpose: the LLM tool-caller would otherwise hallucinate the optional
+# parameter (see the agent-tool-signature gotcha). 22 A is a bit tighter than
+# blind_dock's 28 A blind box because the site is now known, but still large
+# enough to explore around the chosen centroid.
+CENTROID_DOCK_BOX = 22.0
 
 
 class DockError(Exception):
@@ -607,6 +614,165 @@ def blind_dock_agent(receptor_pdb: str, smiles_list: list[str]) -> str:
         + pocket centers, one block per molecule with score
     """
     return blind_dock(receptor_pdb, smiles_list, npockets=1)
+
+
+def dock_at_centroid(receptor_pdb, smiles_list, center, box_size=22.0,
+                     exhaustiveness=8, num_modes=3, seed=0, cpu=0,
+                     overwrite_receptor=False, verbose=False):
+    """Dock a list of ligands into a receptor at a KNOWN box center.
+
+    Unlike blind_dock (which detects pockets), this docks into a single box
+    centered on `center` -- e.g. the centroid of a co-crystallized ligand
+    returned by modrag_protein_functions.find_ligand_centroids, or any other
+    user-supplied site. Use this when the binding site is already known.
+
+    Persisted artefacts (next to the input PDB):
+      - <stem>.pdbqt      rigid receptor (built once, reused across calls
+                          unless overwrite_receptor=True)
+      - <stem>_c<i>.sdf   top poses for molecule i ("c" = centroid dock, to
+                          avoid clobbering <stem>_<i>.sdf from blind_dock)
+    Per-run intermediates (ligand PDBQT, poses/logs) go to a temp dir that is
+    cleaned up at the end.
+
+    Args:
+        receptor_pdb: path to a receptor PDB file.
+        smiles_list: iterable of ligand SMILES strings.
+        center: (x, y, z) box center in Angstroms.
+        box_size: cubic box edge length in Angstroms (22); the box is the same
+            size on all three axes.
+        exhaustiveness, num_modes, seed, cpu: Vina params. num_modes caps the
+            poses written to each SDF at 3 (Vina outputs num_modes poses; the
+            SDF keeps the top 3).
+        overwrite_receptor: rebuild <stem>.pdbqt even if it already exists.
+        verbose: if True, surface Vina/obabel progress on stdout/stderr;
+            default False (quiet; failures are captured in the report).
+
+    Returns:
+        A multi-line string report (header with receptor + center + box +
+        receptor-PDBQT path, one block per molecule with score + pose-SDF
+        path, and an overall best-molecule line). Failed molecules are
+        marked and do not abort the rest.
+
+    Raises:
+        DockError only for setup failures that affect every molecule (receptor
+        missing, obabel/Vina not found). Per-molecule failures are caught and
+        reported, not raised.
+    """
+    print("vina_dock: docking at centroid...")
+    print('==============================================')
+
+    if isinstance(smiles_list, str):
+        smiles_list = [smiles_list]
+
+    if not os.path.exists(receptor_pdb):
+        raise DockError(f"receptor not found: {receptor_pdb}")
+    require("obabel")
+    vina_bin = find_vina_bin(None)  # always use dockstring's vendored copy
+    receptor_pdb = os.path.abspath(receptor_pdb)
+    stem = os.path.splitext(receptor_pdb)[0]
+    rec_pdbqt = stem + ".pdbqt"
+    center = [float(c) for c in center]
+    box = [float(box_size)] * 3
+
+    # Quiet mode: swallow the helpers' progress/warning prints so the returned
+    # report is the sole, clean output (same approach as blind_dock).
+    with contextlib.ExitStack() as stack:
+        if not verbose:
+            stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+            stack.enter_context(contextlib.redirect_stderr(io.StringIO()))
+            try:
+                from rdkit import RDLogger
+                RDLogger.DisableLog("rdApp.*")
+                stack.callback(RDLogger.EnableLog, "rdApp.*")
+            except Exception:
+                pass
+
+        # 1) rigid receptor PDBQT (build once, reuse across calls)
+        if overwrite_receptor or not os.path.exists(rec_pdbqt):
+            build_receptor_pdbqt(receptor_pdb, rec_pdbqt)
+
+        # 2) dock each ligand into the single given box, keep the score
+        work = tempfile.mkdtemp(prefix="dock_at_centroid_")
+        vina_args = SimpleNamespace(exhaustiveness=exhaustiveness,
+                                    num_modes=max(num_modes, 3), cpu=cpu, seed=seed)
+        n_out_poses = min(3, vina_args.num_modes)
+        results = []  # (idx, smi, affinity, sdf_path, status, detail)
+        for idx, smi in enumerate(smiles_list):
+            sdf_path = f"{stem}_c{idx}.sdf"
+            try:
+                lig_sdf = os.path.join(work, f"ligand_{idx}.sdf")
+                lig_pdbqt = os.path.join(work, f"ligand_{idx}.pdbqt")
+                build_ligand_pdbqt(smi, lig_sdf, lig_pdbqt)
+                poses_pdbqt = os.path.join(work, f"poses_{idx}.pdbqt")
+                log_path = os.path.join(work, f"vina_{idx}.log")
+                run_vina(vina_bin, rec_pdbqt, lig_pdbqt, center, box,
+                         vina_args, poses_pdbqt, log_path)
+                aff, nmodes = parse_vina_log(log_path)
+                if aff is None:
+                    results.append((idx, smi, None, sdf_path, "failed",
+                                    "no score parsed from Vina log"))
+                    continue
+                convert(["obabel", "-ipdbqt", poses_pdbqt, "-osdf", "-O", sdf_path,
+                         "-l", str(n_out_poses)],
+                        f"pose PDBQT->SDF (mol {idx}, top {n_out_poses})")
+                results.append((idx, smi, aff, sdf_path, "ok", f"{nmodes} modes"))
+            except DockError as e:
+                results.append((idx, smi, None, sdf_path, "failed", str(e)))
+            except Exception as e:  # defensive: never let one molecule kill the run
+                results.append((idx, smi, None, sdf_path, "error",
+                                f"{type(e).__name__}: {e}"))
+
+    shutil.rmtree(work, ignore_errors=True)
+
+    # 3) build the report
+    lines = []
+    lines.append("Centroid docking report")
+    lines.append(f"  receptor:         {receptor_pdb}")
+    lines.append(f"  receptor PDBQT:   {rec_pdbqt}")
+    lines.append(f"  vina binary:      {vina_bin}")
+    lines.append(f"  box center:       ({center[0]:.3f}, {center[1]:.3f}, {center[2]:.3f})")
+    lines.append(f"  box size:         {box[0]:.1f} A (cubic)")
+    lines.append("")
+    lines.append(f"Molecules ({len(results)}):")
+    for idx, smi, aff, sdf, status, detail in results:
+        lines.append(f"  [{idx}] {smi}")
+        if status == "ok":
+            lines.append(f"        score: {aff:.2f} kcal/mol   ({detail})")
+            lines.append(f"        poses SDF (top {n_out_poses}): {sdf}")
+        else:
+            lines.append(f"        {status}: {detail}")
+    lines.append("")
+    ok = [r for r in results if r[4] == "ok"]
+    if ok:
+        bidx, bsmi, baff, bsdf, _, _ = min(ok, key=lambda r: r[2])
+        lines.append(f"Best molecule: [{bidx}] {bsmi}  "
+                     f"score={baff:.2f} kcal/mol  SDF={bsdf}")
+    else:
+        lines.append("Best molecule: none docked successfully")
+    return "\n".join(lines)
+
+
+def dock_at_centroid_agent(receptor_pdb: str, smiles_list: list[str],
+                           center_x: float, center_y: float, center_z: float) -> str:
+    """
+    Dock ligands into a protein at a KNOWN binding-site center (e.g. the
+    centroid of a co-crystallized ligand returned by find_ligand_centroids,
+    or any chosen x,y,z). Use this instead of blind_dock_agent when the
+    binding site / a reference ligand centroid is already known.
+
+    Args:
+        receptor_pdb: path to a receptor PDB file.
+        smiles_list: iterable list of ligand SMILES strings.
+        center_x: box-center X coordinate in Angstroms.
+        center_y: box-center Y coordinate in Angstroms.
+        center_z: box-center Z coordinate in Angstroms.
+    Returns:
+        A multi-line string report (header with receptor + center + box +
+        one block per molecule with score and pose-SDF path).
+    """
+    return dock_at_centroid(receptor_pdb, smiles_list,
+                            center=(center_x, center_y, center_z),
+                            box_size=CENTROID_DOCK_BOX)
 
 
 # --- main ------------------------------------------------------------------
