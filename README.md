@@ -24,6 +24,11 @@ where it is), and dock the requested ligands with AutoDock Vina.
   tool required.
 - **AutoDock Vina docking.** Each ligand is docked into the top-ranked pocket(s);
   the best-scoring pose is written out as an `.sdf` for inspection in PyMOL.
+- **Docking at a known site.** When the PDB structure has a co-crystallized
+  ligand, `find_ligand_centroids` lists each bound small molecule with its
+  centroid and QED drug-likeness score, and `dock_at_centroid_agent` docks into
+  a box centered on a chosen centroid — preferring a *known* binding site over
+  blind pocket detection. See [Docking at a known site](#docking-at-a-known-site).
 - **Caching.** Receptors already present in `pdb_files/` (matched by PDB ID) are
   reused instead of being re-downloaded.
 - **Proximity-fallback-to-second-pocket (opt-in).** When enabled, blind docking
@@ -47,7 +52,7 @@ dock_assist/
 └── README.md
 ```
 
-The agent exposes four tools to the LLM:
+The agent exposes seven tools to the LLM:
 
 | Tool | Purpose |
 |------|---------|
@@ -55,6 +60,8 @@ The agent exposes four tools to the LLM:
 | `get_protein_from_pdb` | Download the `.pdb` file for a chosen PDB ID (reuses cached files). |
 | `smiles_node` | Resolve molecule names to SMILES via PubChem. |
 | `blind_dock_agent` | Detect binding pockets and dock the ligands (see below). |
+| `find_ligand_centroids` | List co-crystallized small molecules in a receptor PDB, with each one's centroid coordinates and QED score — for docking at a known site (see below). |
+| `dock_at_centroid_agent` | Dock the ligands into a single box centered on a known x,y,z (e.g. a ligand centroid from `find_ligand_centroids`). |
 | `check_nearby_molecules` | Checks for docked ligand proximity to crystal small molecules. |
 
 ---
@@ -159,6 +166,10 @@ python3 vina_dock.py --receptor pdb_files/SULT1A3_2A3R.pdb \
 python3 vina_dock.py --receptor pdb_files/SULT1A3_2A3R.pdb \
     --smiles 'c1cc2ccccc2cc1O' --blind --blind-npockets 3
 ```
+
+The `--center` form is the manual equivalent of `dock_at_centroid_agent`: run
+`find_ligand_centroids` on the receptor to get a co-crystallized ligand's
+centroid, then pass it as `--center` (Vina caps each box dimension at 30 Å).
 
 ---
 
@@ -398,14 +409,91 @@ proximity fallback: enabled but no co-crystallized ligand found; falling back to
 
 ---
 
+## Docking at a known site
+
+Blind docking detects pockets from scratch, which is what you want when the
+binding site is unknown. But many PDB structures *already* contain a
+co-crystallized ligand (an inhibitor, substrate, or cofactor) bound in the
+active site — and in that case the ligand's own location is the best possible
+box center. The agent prefers this path when a bound ligand is present
+(it's encoded directly in the system prompt).
+
+The flow is two tools:
+
+1. **`find_ligand_centroids`** — given the receptor PDB, parses its `HETNAM`/
+   `HETATM` records, skips waters/inorganic ions and tiny fragments (fewer than
+   `MIN_HET_HEAVY_ATOMS = 5` heavy atoms, or anything with no carbon), and for
+   each remaining small-molecule occurrence reports its name, residue symbol,
+   chain, heavy-atom count, **centroid** (the mean of its heavy-atom
+   coordinates), and a **QED** drug-likeness score (0–1, computed by building an
+   RDKit `Mol` directly from the ligand's own HETATM atoms — no 3-letter-code
+   lookup). QED is `n/a` if bond orders can't be perceived from the 3D geometry,
+   but the centroid is still returned. The output ends with a hint to pass one of
+   the centroids to `dock_at_centroid_agent`.
+
+2. **`dock_at_centroid_agent`** — docks each ligand into a single cubic box
+   centered on the chosen `(center_x, center_y, center_z)`, with
+   `box_size = CENTROID_DOCK_BOX = 22.0` Å on all three axes. Otherwise it
+   behaves like `blind_dock_agent`: it builds the rigid receptor PDBQT once
+   (reused across calls), docks each SMILES, keeps the top 3 poses per molecule,
+   and returns a multi-line report (receptor, box center/size, per-molecule
+   score + pose-SDF path, and an overall best-molecule line). Per-molecule
+   failures are reported, not raised.
+
+Use `blind_dock_agent` when the binding site is unknown; use
+`find_ligand_centroids` + `dock_at_centroid_agent` when the structure has a
+reference ligand you want to redock against.
+
+### What you'll see in the output
+
+`find_ligand_centroids` prints one block per co-crystallized small molecule:
+
+```
+Co-crystallized small molecules in pdb_files/SULT1A3_2A3R.pdb:
+  [1] DOPAMINE (DAM, chain A): 10 heavy atoms
+        centroid: (21.453, 33.118, 42.890)
+        QED: 0.582
+  [2] S-ADENOSYLMETHIONINE (SAM, chain A): 26 heavy atoms
+        centroid: (19.204, 30.517, 40.113)
+        QED: 0.731
+Use dock_at_centroid_agent with one of these centroids (center_x, center_y, center_z) to dock at that site.
+```
+
+`dock_at_centroid_agent` then returns a centroid-docking report:
+
+```
+Centroid docking report
+  receptor:         pdb_files/SULT1A3_2A3R.pdb
+  receptor PDBQT:   pdb_files/SULT1A3_2A3R.pdbqt
+  vina binary:      .../dockstring/vina
+  box center:       (21.453, 33.118, 42.890)
+  box size:         22.0 A (cubic)
+
+Molecules (1):
+  [0] C1=CC(=CC=C1CCN)O
+        score: -6.80 kcal/mol   (9 modes)
+        poses SDF (top 3): pdb_files/SULT1A3_2A3R_c0.sdf
+
+Best molecule: [0] C1=CC(=CC=C1CCN)O  score=-6.80 kcal/mol  SDF=pdb_files/SULT1A3_2A3R_c0.sdf
+```
+
+(If the PDB has no qualifying small molecule, `find_ligand_centroids` reports
+`none with >= 5 heavy atoms found` and the agent falls back to
+`blind_dock_agent`.)
+
+---
+
 ## Files written by a run
 
 - `pdb_files/<protein_name>_<pdb_id>.pdb` — the fetched receptor (kept across runs;
   reused if a file with the same PDB ID already exists, even under a different
   protein name).
 - `pdb_files/<stem>_<i>.sdf` — the docked poses (top 3) for ligand *i*, from its
-  best-scoring pocket. **These are deleted at the start of the next run**, so
-  move any you want to keep.
+  best-scoring pocket (blind docking). **These are deleted at the start of the
+  next run**, so move any you want to keep.
+- `pdb_files/<stem>_c<i>.sdf` — the docked poses (top 3) for ligand *i* from a
+  centroid dock (`c` = centroid, to avoid clobbering the blind-dock SDF above).
+  Also deleted at the start of the next run.
 - `<stem>.pdbqt` — the rigid receptor PDBQT built once and reused across calls.
 - Per-run intermediates (ligand PDBQT, per-pocket poses/logs) go to a temp
   directory that is cleaned up at the end.
