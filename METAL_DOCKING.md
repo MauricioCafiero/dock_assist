@@ -173,7 +173,8 @@ records are ligand-only and rejected as "Unknown or inappropriate tag".
   N/O/S–ion distance, ≤ 2.5 Å = coordination).
 - Caches live next to the input PDB: `<stem>_mk.pdbqt` (meeko receptor),
   `<stem>_mkTZ.pdbqt` (+ TZ), `<stem>_metal.pdbqt`; maps/GPFs are per-ligand
-  because `prepare_gpf4zn` derives ligand atom types per molecule.
+  because `prepare_gpf4zn` derives ligand atom types per molecule. The tier
+  0/1 engine's receptor cache is `<stem>_map.pdbqt`.
 - `dock_assist.py`: both tools registered (tool list, dispatch map, chat
   `tools=`, 3×) plus a metalloprotein paragraph in the system prompt.
 - `run_vina` gained the backward-compatible `no_log` flag (default preserves
