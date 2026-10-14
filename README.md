@@ -36,6 +36,16 @@ where it is), and dock the requested ligands with AutoDock Vina.
   near a co-crystallized ligand, switches to the second-best pocket when it
   *does* — preferring **proximity to a known ligand over Vina score**. See
   [Proximity fallback](#proximity-fallback-to-second-pocket-opt-in).
+- **Metal-site docking (tiered metal engines).** `detect_metal_sites_agent`
+  lists the metal ions in a receptor (element, coordinates, coordinating
+  residues); `dock_metal_site_agent` docks into the metal site, choosing the
+  engine by ion: **Zn²⁺** gets the zinc-calibrated **AutoDock4Zn force field**,
+  **Mg/Ca/Mn/Fe** get AutoGrid maps with the stock AutoDock metal parameters,
+  **Cu/Co/Ni/Cd/Hg/Na/K** get maps with literature ion parameters (Li & Merz
+  12-6-4; Joung & Cheatham) plus zinc-calibrated donor site terms in both map
+  engines, and the rest keep the metal in the receptor — every
+  pose carries a coordination check. See
+  [Metal-site docking](#metal-site-docking-ad4zn).
 
 ---
 
@@ -47,12 +57,14 @@ dock_assist/
 │   ├── dock_assist.py              # agent CLI: prompt loop, tool dispatch, Ollama client
 │   ├── modrag_protein_functions.py # PDB search, PDB retrieval, SMILES lookup
 │   └── vina_dock.py                # blind pocket detection + AutoDock Vina docking
+├── ad4zn/                          # metal-docking scripts; AD4Zn.dat (AutoDock-Vina repo)
+│                                   # + AD4Merz.dat (lit.-parameter metals, generated)
 ├── pdb_files/                      # fetched receptors (.pdb) + docked poses (.sdf)
 ├── requirements.txt
 └── README.md
 ```
 
-The agent exposes seven tools to the LLM:
+The agent exposes nine tools to the LLM:
 
 | Tool | Purpose |
 |------|---------|
@@ -63,6 +75,8 @@ The agent exposes seven tools to the LLM:
 | `find_ligand_centroids` | List co-crystallized small molecules in a receptor PDB, with each one's centroid coordinates and QED score — for docking at a known site (see below). |
 | `dock_at_centroid_agent` | Dock the ligands into a single box centered on a known x,y,z (e.g. a ligand centroid from `find_ligand_centroids`). |
 | `check_nearby_molecules` | Checks for docked ligand proximity to crystal small molecules. |
+| `detect_metal_sites_agent` | List the metal ions (Zn, Mg, Ca, Fe, …) in a receptor with coordinates and coordinating residues. |
+| `dock_metal_site_agent` | Dock into a metal-ion site; the force field is chosen per metal (AD4Zn for Zn²⁺, map engines with stock/literature metal parameters otherwise — see below). |
 
 ---
 
@@ -87,6 +101,16 @@ You also need:
 - **A Vina binary.** By default `vina_dock.py` reuses the copy of AutoDock Vina
   vendored inside the `dockstring` package (no separate install needed). A
   `--vina-bin` flag is available if you want to point at a different build.
+- **Metal-site docking (optional, for `detect_metal_sites_agent` /
+  `dock_metal_site_agent`).** The metal path adds three user-space components
+  (no system installers): (1) **meeko** — installed by `requirements.txt`;
+  (2) a **Vina ≥ 1.2 CLI** (`--scoring ad4`/`--maps` need 1.2; the dockstring
+  binary is 1.1.2) — e.g. `conda create -n vina -c conda-forge vina`; (3) the
+  **ADFR suite's `pythonsh` + `autogrid4`** — e.g.
+  `CONDA_SUBDIR=osx-64 conda create -n adfr-suite -c hcc adfr-suite`, plus the
+  AD4Zn scripts/parameter file in `ad4zn/` (already in the repo). Paths can be
+  moved via the `ADFR_PYTHONSH`, `AUTOGRID_BIN`, `VINA_12_BIN` and `AD4ZN_DIR`
+  environment variables. See [Metal-site docking](#metal-site-docking-ad4zn).
 
 ---
 
@@ -331,6 +355,63 @@ sieves without touching code:
 
 The validated plateau (`top_frac ∈ [0.04, 0.08]`, `min_samples ∈ [20, 40]`) is
 the safe region to experiment in.
+
+---
+
+## Metal-site docking (AD4Zn)
+
+For metalloproteins, the workflow treats the metal ion as the binding site:
+
+1. **`detect_metal_sites_agent`** scans the receptor PDB (HETATM records) for
+   biologically common metal ions (Zn, Mg, Ca, Fe, Mn, Cu, Co, Ni, Hg, Cd, Na,
+   K) and reports each ion's element, chain/residue id, x/y/z coordinates and
+   its **coordinating residues** — any PDB atom within 2.5 Å, which is the
+   first coordination sphere.
+2. **`dock_metal_site_agent`** docks a box centered on the metal ion (passed
+   the ion's coordinates from step 1; the ion is snapped up to 3 Å). The
+   engine is chosen by the ion, in code, never by the LLM:
+
+| Metal | Engine | What it is |
+|---|---|---|
+| **Zn²⁺** | **AutoDock4Zn** (`ad4zn`) | The zinc-calibrated force field of Santos-Martins et al. (JCIM 2014): tetrahedral `TZ` pseudo-atoms are placed around the ion and zinc pairwise terms are folded into AutoGrid maps (`prepare_gpf4zn.py` + `autogrid4`), which Vina ≥ 1.2 then docks against via `--scoring ad4 --maps`. Coordination geometry is directional and affects the score. |
+| **Mg²⁺, Ca²⁺, Mn²⁺, Fe²⁺** | `ad4map` (tier 0) | The same AutoGrid-maps machinery as zinc, but without TZ atoms: the ion sits in the receptor using the **stock metal parameters already in `AD4Zn.dat`** (vdW, formal +2 charge, desolvation), plus donor site terms (`nbp_r_eps`) placing effective pair wells at each metal's crystal-chemical contact distance (Mg–O 2.07 Å, Ca–O 2.35 Å, …). A real metal force field instead of Vina's vdW sphere. Validated redock: donor contacts land 1.9–2.4 Å; the coordination post-check reports the distance. |
+| **Cu²⁺, Co²⁺, Ni²⁺, Cd²⁺, Hg²⁺, Na⁺, K⁺** | `ad4merz` (tier 1) | Metals that stock `AD4Zn.dat` doesn't parameterize at all get **literature self-parameters** in `ad4zn/AD4Merz.dat` (Li & Merz 12-6-4, TIP3P, JCTC 2014; Joung & Cheatham, JPCB 2008, for Na⁺/K⁺) plus the same donor site wells at their own contact distances: the r⁻⁴ induced-dipole term of the 12-6-4 potential is absorbed into the effective donor pair well, anchored on the zinc calibration (the metal's charge-dependence comes through the electrostatics map, so Na⁺/K⁺ get the same wells as the divalent ions). Every pose is coordination-checked. |
+| all others | `vina-metal` | The metal ion is kept in the receptor PDBQT (waters/cofactors still dropped) and docked with plain Vina 1.2 scoring. A metal atom scores as a generic vdW sphere — **scores are approximate** — so every pose is post-checked for coordination (donor N/O/S within 2.5 Å of the ion) and the result is reported per molecule. |
+
+All three non-zinc engines report each pose's donor-to-ion distance, so even
+where the scoring is approximate, the coordination readout is honest. Tier-1
+parameters are published values but their *docking-pose* accuracy is
+unvalidated — see the redocking-benchmark note below (and `METAL_DOCKING.md`).
+
+Validated end-to-end on the zinc protease **1s63** (the AutoDock-Vina zinc
+tutorial's benchmark): the co-crystallized inhibitor — generated from its
+SMILES, not its coordinates — redocks at **−12.1 kcal/mol** with a chelating
+nitrogen **1.91 Å** from the zinc (crystallographic Zn–N ≈ 2.0–2.2 Å; the
+tutorial's own reference score is ≈ −13.5).
+
+Implementation notes (all decided in `vina_dock.py`, not visible to the agent):
+
+- The AD4Zn pipeline preps the receptor/ligand with **meeko**, adds TZ
+  pseudo-atoms with the official `zinc_pseudo.py`, generates one
+  ligand-specific GPF + AutoGrid map set per site (cached receptor PDBQTs are
+  reused: `<stem>_mk.pdbqt`, `<stem>_mkTZ.pdbqt`, `<stem>_metal.pdbqt`).
+- Tier 0/1 preps the receptor with **meeko too, but on the protein only**
+  (meeko fails template-matching any non-Zn ion, and the openbabel-wheel
+  obabel the CLI resolves either writes all-zero charges or, with
+  `--partialcharge gasteiger`, silently converts the metal-containing
+  molecule to nothing): each metal ion is then appended as a hand-built
+  receptor line with its formal charge (`+2.000 Mg`, `+1.000 Na`, …) —
+  AutoGrid's electrostatics map reads the PDBQT charge, and autogrid refuses
+  a zero-charged receptor outright. Cached receptor: `<stem>_map.pdbqt`.
+- The grid center is **always pinned to the metal ion** — AutoGrid's
+  `gridcenter auto` centers on the receptor bounding box, which silently docks
+  into empty space (observed score +1.5 vs −12.1 with a correct center).
+- Tool locations default to the conda envs built in
+  [Installation](#installation) and can be moved with the `ADFR_PYTHONSH`,
+  `AUTOGRID_BIN`, `VINA_12_BIN` and `AD4ZN_DIR` environment variables.
+- Scores between the AD4Zn and organic `vina` scoring functions are **not
+  comparable** (different force fields); tier 0/1 and AD4Zn scores likewise
+  aren't comparable to each other.
 
 ---
 

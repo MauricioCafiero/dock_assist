@@ -9,7 +9,7 @@ from rich.console import Console
 from rich.markdown import Markdown
 
 from modrag_protein_functions import get_protein_from_pdb, find_PDBID_node, smiles_node, check_nearby_molecules, find_ligand_centroids
-from vina_dock import blind_dock_agent, dock_at_centroid_agent
+from vina_dock import blind_dock_agent, dock_at_centroid_agent, dock_metal_site_agent, detect_metal_sites_agent
 console = Console(width=80)
 import modrag_protein_functions
 import vina_dock
@@ -41,7 +41,8 @@ modrag_protein_functions.print_flag = print_flag
 vina_dock.FALLBACK_TO_SECOND_POCKET = use_second_pocket_fallback
 
 tools = [find_PDBID_node, get_protein_from_pdb, smiles_node, check_nearby_molecules,
-         find_ligand_centroids, blind_dock_agent, dock_at_centroid_agent]
+         find_ligand_centroids, blind_dock_agent, dock_at_centroid_agent,
+         detect_metal_sites_agent, dock_metal_site_agent]
 
 #get ket from shell variable $OLLAMA_API_KEY
 ollama_key = os.getenv('OLLAMA_API_KEY')
@@ -81,6 +82,18 @@ inhibitor with the best QED, or the one matching the user's intent), and call
 dock_at_centroid_agent with that molecule's centroid (center_x, center_y,
 center_z) to dock at that known site.
 
+Metalloproteins: if the protein binds a metal ion (e.g. a zinc protease or a
+Mg/Ca/Cu binding site), first call detect_metal_sites_agent on the receptor PDB
+to list the metal ions with their element, coordinates and coordinating
+residues, then call dock_metal_site_agent with the target metal ion's
+(center_x, center_y, center_z) coordinates instead of the centroid tools. The
+docking engine is chosen per metal: Zn2+ uses the zinc-specific AD4Zn force
+field, Mg/Ca/Mn/Fe use AutoGrid maps with standard AutoDock metal parameters,
+Cu/Co/Ni/Cd/Hg/Na/K use maps with literature ion parameters (both map engines
+carry donor site terms that place coordination wells at crystal-chemical
+metal-donor contact distances so poses can coordinate the ion), and
+for every non-zinc engine each pose is checked for actual metal coordination.
+
 After docking, if the PDB structure has a ligand bound, you should also check for nearby molecules in the
 PDB file (using the tool) to assess if the docking has located the correct binding site.
 '''
@@ -114,7 +127,9 @@ def chat_turn(prompt: str):
     'blind_dock_agent': blind_dock_agent,
     'dock_at_centroid_agent': dock_at_centroid_agent,
     'find_ligand_centroids': find_ligand_centroids,
-    'check_nearby_molecules': check_nearby_molecules
+    'check_nearby_molecules': check_nearby_molecules,
+    'detect_metal_sites_agent': detect_metal_sites_agent,
+    'dock_metal_site_agent': dock_metal_site_agent
   }
 
   messages.append({'role': 'user', 'content': prompt})
@@ -124,7 +139,8 @@ def chat_turn(prompt: str):
           model=model,
           messages=messages,
           tools=[find_PDBID_node, get_protein_from_pdb, smiles_node, check_nearby_molecules,
-                 find_ligand_centroids, blind_dock_agent, dock_at_centroid_agent],
+                 find_ligand_centroids, blind_dock_agent, dock_at_centroid_agent,
+                 detect_metal_sites_agent, dock_metal_site_agent],
           think=True,
       )
       messages.append(response.message)
