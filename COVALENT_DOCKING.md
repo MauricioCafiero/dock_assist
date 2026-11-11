@@ -269,33 +269,27 @@ From `python3 code/test_covalent.py` at the tutorial's settings
 (`COVALENT_GA_RUNS = 10`, `COVALENT_GA_EVALS = 2500000`), 2026-11-11. All four
 cases dock, all from the free drug SMILES against a HETATM-stripped receptor:
 
-| PDB | drug | warhead err | centroid | overlap | RMSD | energy (Ki) | drift |
+Two runs of the identical setup (same receptor, `ga_run 10`, differing only in
+the GA seed), because one run is not informative:
+
+| PDB | drug | centroid | overlap | RMSD | centroid | overlap | RMSD |
 |---|---|---|---|---|---|---|---|
-| 6OIM | sotorasib | 1.60 Å | 2.46 Å | 68 % | 5.67 Å | −8.50 (586 nM) | 0.007 Å |
-| 7RFS | nirmatrelvir | 0.77 Å | 1.61 Å | 86 % | 2.28 Å | −12.67 (519 pM) | 0.002 Å |
-| 4G5J | afatinib | 0.93 Å | 0.56 Å | **100 %** | **1.12 Å** | −8.38 (720 nM) | 0.008 Å |
-| 5P9J | ibrutinib | 0.16 Å | 0.58 Å | 94 % | **1.06 Å** | −10.48 (20.8 nM) | 0.013 Å |
+| | | *run 1* | | | *run 2* | | |
+| 6OIM | sotorasib | 2.46 Å | 68 % | 5.67 Å | 0.15 Å | 100 % | 1.22 Å |
+| 7RFS | nirmatrelvir | 1.61 Å | 86 % | 2.28 Å | 0.59 Å | 97 % | 1.26 Å |
+| 4G5J | afatinib | 0.56 Å | 100 % | 1.12 Å | 4.34 Å | 56 % | 9.18 Å |
+| 5P9J | ibrutinib | 0.58 Å | 94 % | 1.06 Å | 0.32 Å | 100 % | 0.71 Å |
 
-These are single runs of a 10-run GA search seeded with `seed pid time`, so
-expect ~1 kcal/mol and some pose variation between repeats (6OIM has come in
-anywhere from -8.3 to -9.7 kcal/mol across runs). Set a fixed `seed` in
-`_build_cov_dpf` if a reproducible benchmark is ever wanted.
+Energies, run 1: −8.50 / −12.67 / −8.38 / −10.48 kcal/mol.
 
-Reading it honestly against the usual ≤2 Å "correct pose" bar: **7RFS and 5P9J
-are solved** (1.25 and 1.19 Å), **6OIM is marginal** (2.21 Å) though its
-centroid and 95 % overlap say the placement is right, and **4G5J is only
-partially right** — see below. Three of four is a good result for a docking
-method, not a perfect one.
-
-**Anchor drift is 0.002–0.013 Å in every case**, which is the point of the
-protocol: AutoDock4 pins the flexible residue's root, so the covalent
-attachment holds no matter what the search does. Compare the Vina attempt
-below, where it never held.
-
-Energies land in a sensible range and rank plausibly — nirmatrelvir, the
-picomolar clinical Mpro inhibitor, scores strongest at −12.76 kcal/mol. These
-are AD4 estimates, not measurements, and no covalent-bond energetics are in
-them (see caveats), so do not read the Ki values as predicted potencies.
+**Pose metrics are not reproducible between seeds, and the spread is larger
+than any effect discussed in this file.** 6OIM moved 5.67 → 1.22 Å RMSD and
+4G5J moved 1.12 → 9.18 Å on nothing but a different seed. Three of four cases
+land near or below 2 Å in at least one run, and every case produces a
+chemically correct, correctly anchored adduct — that is what the engine can be
+said to do. Any single-run comparison in this file, including between the two
+columns above, is noise. Quantifying this properly needs repeats
+(`seed` is `pid time`; set it fixed in `_build_cov_dpf` for reproducibility).
 
 **On the earlier protein-only numbers: don't treat them as a baseline.** An
 earlier version of this engine stripped every HETATM, and its figures (6OIM
@@ -305,17 +299,16 @@ is a less physical model of the binding site, so where those numbers look
 better that is not evidence that deleting cofactors helps — it is a comparison
 against an artifact. The table above is the result.
 
-What can fairly be said is that 4G5J no longer disagrees with itself. Under
-protein-only it showed the signature of a mis-mapped pose — a low centroid
-error alongside a 7.33 Å RMSD — and that signature is gone (0.56 Å centroid,
-1.12 Å RMSD, 100 % overlap). Worth knowing when reading that row: 4G5J also
-holds two copies of *unreacted* afatinib (`0WM A1102`, `0WM A1103`) at
-13.65 Å and 20.09 Å from Cys797 SG, both retained; the nearer one is probably
-inside the grid box and may be bounding the search.
+An earlier draft of this file claimed 4G5J "no longer disagrees with itself"
+after heteroatoms were retained. Run 2 falsifies that: it reproduces exactly
+the mis-mapped signature (4.34 Å centroid with 9.18 Å RMSD). The claim was
+drawn from a single run and should not have been made. Worth knowing when
+reading that row: 4G5J also retains two copies of *unreacted* afatinib
+(`0WM A1102`, `0WM A1103`) at 13.65 Å and 20.09 Å from Cys797 SG; the nearer
+one is probably inside the grid box.
 
-All single runs. Four same-receptor repeats of 6OIM spanned 1.40 kcal/mol
-(−8.34 to −9.74), so one-run differences of that order between rows are noise,
-and pose-metric differences have not been measured against repeats at all.
+Energy repeats on 6OIM spanned 1.40 kcal/mol (−8.34 to −9.74) across four
+same-receptor runs.
 
 ## Agent-loop test
 
