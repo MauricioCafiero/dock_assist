@@ -214,9 +214,12 @@ can do covalent docking) but **[measured] both segfault on this machine**
 
 `code/test_covalent.py` redocks four classic covalent complexes from the
 **free drug SMILES** and compares the predicted pose with the crystal adduct.
-Each entry has a crystallographic `LINK` record giving the real bond, and the
-receptor is the protein-only chain A (all HETATMs dropped, so the crystal
-ligand cannot bias the result).
+Each entry has a crystallographic `LINK` record giving the real bond. The
+harness hands the engine the **raw PDB**, so the receptor is prepared exactly
+as in normal use: cofactors and metal ions retained, waters dropped, and the
+bound adduct removed via its `LINK` record so it cannot bias the result. That
+is also the physically correct model of the site — KRAS's GDP and Mg really
+are there — and it is what the numbers below were measured on.
 
 | PDB | Target | Drug | Residue | Warhead | Crystal bond |
 |---|---|---|---|---|---|
@@ -266,12 +269,12 @@ From `python3 code/test_covalent.py` at the tutorial's settings
 (`COVALENT_GA_RUNS = 10`, `COVALENT_GA_EVALS = 2500000`), 2026-11-11. All four
 cases dock, all from the free drug SMILES against a HETATM-stripped receptor:
 
-| PDB | drug | warhead err | centroid | overlap | RMSD | energy (Ki) |
-|---|---|---|---|---|---|---|
-| 6OIM | sotorasib | 1.60 Å | 2.46 Å | 68 % | 5.67 Å | — |
-| 7RFS | nirmatrelvir | 0.77 Å | 1.61 Å | 86 % | 2.28 Å | — |
-| 4G5J | afatinib | 0.93 Å | 0.56 Å | **100 %** | **1.12 Å** | — |
-| 5P9J | ibrutinib | 0.16 Å | 0.58 Å | 94 % | **1.06 Å** | — |
+| PDB | drug | warhead err | centroid | overlap | RMSD | energy (Ki) | drift |
+|---|---|---|---|---|---|---|---|
+| 6OIM | sotorasib | 1.60 Å | 2.46 Å | 68 % | 5.67 Å | −8.50 (586 nM) | 0.007 Å |
+| 7RFS | nirmatrelvir | 0.77 Å | 1.61 Å | 86 % | 2.28 Å | −12.67 (519 pM) | 0.002 Å |
+| 4G5J | afatinib | 0.93 Å | 0.56 Å | **100 %** | **1.12 Å** | −8.38 (720 nM) | 0.008 Å |
+| 5P9J | ibrutinib | 0.16 Å | 0.58 Å | 94 % | **1.06 Å** | −10.48 (20.8 nM) | 0.013 Å |
 
 These are single runs of a 10-run GA search seeded with `seed pid time`, so
 expect ~1 kcal/mol and some pose variation between repeats (6OIM has come in
@@ -294,14 +297,25 @@ picomolar clinical Mpro inhibitor, scores strongest at −12.76 kcal/mol. These
 are AD4 estimates, not measurements, and no covalent-bond energetics are in
 them (see caveats), so do not read the Ki values as predicted potencies.
 
-**4G5J was previously the outlier** (7.33 Å RMSD at 76 % overlap) when the
-receptor was stripped of all HETATM. Retaining heteroatoms brought it to
-1.12 Å at 100 % overlap. Note what is retained there, though: 4G5J holds two
-further copies of *unreacted* afatinib (`0WM A1102`, `0WM A1103`) at 13.65 Å
-and 20.09 Å from Cys797 SG — outside the pocket, but near enough that the
-closer one likely sits inside the grid box. So the improvement may owe
-something to those copies bounding the search rather than to cofactors
-shaping the site.
+**On the earlier protein-only numbers: don't treat them as a baseline.** An
+earlier version of this engine stripped every HETATM, and its figures (6OIM
+0.35 Å centroid / 95 % overlap / 2.21 Å RMSD; 4G5J 7.33 Å RMSD / 76 %
+overlap) appear in this file's history. A receptor with its cofactors deleted
+is a less physical model of the binding site, so where those numbers look
+better that is not evidence that deleting cofactors helps — it is a comparison
+against an artifact. The table above is the result.
+
+What can fairly be said is that 4G5J no longer disagrees with itself. Under
+protein-only it showed the signature of a mis-mapped pose — a low centroid
+error alongside a 7.33 Å RMSD — and that signature is gone (0.56 Å centroid,
+1.12 Å RMSD, 100 % overlap). Worth knowing when reading that row: 4G5J also
+holds two copies of *unreacted* afatinib (`0WM A1102`, `0WM A1103`) at
+13.65 Å and 20.09 Å from Cys797 SG, both retained; the nearer one is probably
+inside the grid box and may be bounding the search.
+
+All single runs. Four same-receptor repeats of 6OIM spanned 1.40 kcal/mol
+(−8.34 to −9.74), so one-run differences of that order between rows are noise,
+and pose-metric differences have not been measured against repeats at all.
 
 ## Agent-loop test
 

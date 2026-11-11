@@ -50,20 +50,28 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 TESTDIR = os.path.join(HERE, "..", "pdb_files", "covalent_tests")
 
 # (pdb id, chain, resseq, drug name, free-drug SMILES, HET code, LINK atom,
-#  crystal bond length)
+#  crystal bond length, warhead name, HETATM groups the receptor prep must
+#  KEEP). The last two are assertions, not description: the warhead name
+#  guards the reaction table, and the keep-list guards against a repeat of the
+#  regression where receptor prep deleted every HETATM, including cofactors
+#  that shape the site. 7RFS and 5P9J legitimately have nothing to keep.
 CASES = [
     ("6OIM", "A", 12, "sotorasib",
      "C[C@H]1CN(CCN1C2=NC(=O)N(C3=NC(=C(C=C32)F)C4=C(C=CC=C4F)O)"
-     "C5=C(C=CN=C5C(C)C)C)C(=O)C=C", "MOV", "C25", 1.81),
+     "C5=C(C=CN=C5C(C)C)C)C(=O)C=C", "MOV", "C25", 1.81,
+     "michael acceptor", {"MG", "GDP"}),
     ("7RFS", "A", 145, "nirmatrelvir",
      "CC1([C@@H]2[C@H]1[C@H](N(C2)C(=O)[C@H](C(C)(C)C)NC(=O)C(F)(F)F)"
-     "C(=O)N[C@@H](C[C@@H]3CCNC3=O)C#N)C", "4WI", "C3", 1.80),
+     "C(=O)N[C@@H](C[C@@H]3CCNC3=O)C#N)C", "4WI", "C3", 1.80,
+     "nitrile", set()),
     ("4G5J", "A", 797, "afatinib",
      "CN(C)C/C=C/C(=O)NC1=C(C=C2C(=C1)C(=NC=N2)NC3=CC(=C(C=C3)F)Cl)"
-     "O[C@H]4CCOC4", "0WN", "C30", 1.84),
+     "O[C@H]4CCOC4", "0WN", "C30", 1.84,
+     "michael acceptor", {"0WM"}),
     ("5P9J", "A", 481, "ibrutinib",
      "C=CC(=O)N1CCC[C@H](C1)N2C3=NC=NC(=C3C(=N2)C4=CC=C(C=C4)OC5=CC=CC=C5)N",
-     "8E8", "CAA", 1.85),
+     "8E8", "CAA", 1.85,
+     "michael acceptor", set()),
 ]
 
 
@@ -200,7 +208,8 @@ def pose_metrics(pose_sdf, resname, lig_ref, link_ref):
 
 
 def run_case(case, ga_runs):
-    pid, chain, resseq, drug, smiles, het, link_atom, bond = case
+    (pid, chain, resseq, drug, smiles, het, link_atom, bond,
+     want_warhead, want_kept) = case
     # Dock against the RAW PDB, not the protein-only copy. The engine does its
     # own HETATM handling (keep cofactors and ions, drop waters and the ligand
     # bound at the covalent site), so feeding it a pre-stripped receptor would
@@ -220,6 +229,41 @@ def run_case(case, ga_runs):
     pose = os.path.splitext(os.path.abspath(prot))[0] + "_cov0.sdf"
     if os.path.exists(pose):
         os.remove(pose)
+
+    # ---- deterministic checks, asserted ---------------------------------
+    # These do not depend on the stochastic search, so they get hard
+    # pass/fail. The pose metrics below are reported but NOT asserted beyond
+    # a catastrophic-failure bound, because a 10-run GA seeded with
+    # `seed pid time` varies between repeats (6OIM has spanned 1.40 kcal/mol)
+    # and a tight threshold would just flake.
+    checks = {}
+    resname, anchor = vd._residue_anchor(prot, chain, resseq)
+    nuc = [float(v) for v in anchor[2]]
+
+    # warhead recognised, and it is the one we expect
+    try:
+        _adduct, warhead, _tether = vd._build_covalent_adduct(smiles, resname)
+        checks["warhead"] = warhead == want_warhead
+        print(f"  warhead: {warhead} (expected {want_warhead}) "
+              f"{'OK' if checks['warhead'] else 'FAIL'}")
+    except Exception as e:
+        checks["warhead"] = False
+        print(f"  warhead: FAIL - {type(e).__name__}: {e}")
+
+    # receptor prep: the bound adduct must go, named cofactors must stay.
+    # This is the guard for the regression that deleted every HETATM.
+    kept_lines, summary = vd._cov_classify_hetatm(prot, chain, resseq, nuc)
+    kept = {l[17:20].strip() for l in kept_lines}
+    removed_site = het not in kept
+    kept_ok = want_kept <= kept
+    via_link = "LINK to target" in summary
+    checks["receptor prep"] = removed_site and kept_ok and via_link
+    print(f"  receptor: {summary}")
+    print(f"    removed the bound {het}: {'OK' if removed_site else 'FAIL'}"
+          f" | kept {sorted(want_kept) or 'nothing expected'}: "
+          f"{'OK' if kept_ok else 'FAIL, got ' + str(sorted(kept))}"
+          f" | identified via LINK: {'OK' if via_link else 'FAIL'}")
+
     try:
         report = vd.dock_covalent(prot, [smiles], chain=chain, resseq=resseq,
                                   ga_runs=ga_runs)
@@ -235,7 +279,26 @@ def run_case(case, ga_runs):
     # serine case can be added to CASES without touching this
     target_resname, _ = vd._residue_anchor(prot, chain, resseq)
     m = pose_metrics(pose, target_resname, lig_ref, link_ref)
-    m.update({"pdb": pid, "drug": drug, "ok": "error" not in m})
+    m.update({"pdb": pid, "drug": drug})
+
+    # atom-count parity: the adduct minus its three mimic atoms must equal the
+    # crystal HET ligand. Catches a mis-stripped mimic or the wrong warhead
+    # regiochemistry, neither of which is stochastic.
+    checks["atom counts"] = m.get("n_docked") == m.get("n_crystal")
+    print(f"  atom counts: {m.get('n_docked')} docked vs "
+          f"{m.get('n_crystal')} crystal "
+          f"{'OK' if checks['atom counts'] else 'FAIL'}")
+
+    # catastrophic-failure bound only. 10 A is far outside run-to-run
+    # variation but would have caught the 17.5-20.5 A misplacements the
+    # earlier Vina-based engine produced.
+    cen = m.get("centroid_err")
+    checks["pose in the site"] = cen is not None and cen <= 10.0
+    print(f"  pose within 10 A of the crystal ligand: "
+          f"{'OK' if checks['pose in the site'] else 'FAIL'} ({cen})")
+
+    m["checks"] = checks
+    m["ok"] = all(checks.values()) and "error" not in m
     print("\n  validation vs crystal:")
     if "error" in m:
         print(f"    error: {m['error']}")
@@ -274,18 +337,38 @@ def main():
     rows = [run_case(c, args.ga_runs) for c in cases]
 
     print(f"\n{'=' * 72}\nSUMMARY\n{'=' * 72}")
-    print(f"{'PDB':6} {'drug':14} {'warhead':>9} {'centroid':>9} "
+    print("Asserted (not affected by the stochastic search):")
+    names = ["warhead", "receptor prep", "atom counts", "pose in the site"]
+    print(f"  {'PDB':6} " + " ".join(f"{n:>16}" for n in names))
+    for r in rows:
+        c = r.get("checks") or {}
+        cells = []
+        for n in names:
+            v = c.get(n)
+            cells.append(f"{'PASS' if v else ('FAIL' if v is not None else '-'):>16}")
+        print(f"  {r['pdb']:6} " + " ".join(cells))
+
+    print("\nReported (single GA runs, vary between repeats -- not asserted):")
+    print(f"  {'PDB':6} {'drug':14} {'warhead':>9} {'centroid':>9} "
           f"{'overlap':>8} {'rmsd':>7}")
     for r in rows:
-        if not r.get("ok"):
-            print(f"{r['pdb']:6} {r['drug']:14} {'FAILED':>9}")
+        if r.get("centroid_err") is None:
+            print(f"  {r['pdb']:6} {r['drug']:14} {'no pose':>9}")
             continue
-        print(f"{r['pdb']:6} {r['drug']:14} "
+        print(f"  {r['pdb']:6} {r['drug']:14} "
               f"{r.get('warhead_err', float('nan')):8.2f}A "
               f"{r.get('centroid_err', float('nan')):8.2f}A "
               f"{r.get('overlap', 0) * 100:7.0f}% "
               f"{('%.2f' % r['rmsd']) if r.get('rmsd') else 'n/a':>7}")
 
+    failed = [r["pdb"] for r in rows if not r.get("ok")]
+    print()
+    if failed:
+        print(f"RESULT: FAIL ({', '.join(failed)})")
+        return 1
+    print(f"RESULT: PASS ({len(rows)}/{len(rows)} cases)")
+    return 0
+
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
