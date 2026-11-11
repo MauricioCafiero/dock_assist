@@ -1665,6 +1665,1158 @@ def dock_metal_site_agent(receptor_pdb: str, smiles_list: list[str],
                            box_size=METAL_DOCK_BOX)
 
 
+# --- covalent docking --------------------------------------------------------
+# The official AutoDock "flexible side chain" covalent docking protocol
+# (Bianco, Forli, Goodsell & Olson, Protein Sci 2015; the adCovalentDockResidue
+# tutorial at autodock.scripps.edu/resources/covalent-docking).
+#
+# The idea: the ligand's warhead is reacted in silico with a mimic of the
+# target side chain, and the resulting ADDUCT is docked as a FLEXIBLE RESIDUE
+# with no ligand at all. AutoDock4 pins a flexible residue's root atom to its
+# input coordinates, so the covalent attachment physically cannot move during
+# the search, while the whole adduct's torsions get a full Lamarckian GA
+# search. That is what makes this a real docking rather than a constrained
+# rescoring: [measured] on 6OIM/sotorasib it reproduces the crystal adduct to
+# 0.29 A centroid error with 98% heavy-atom overlap and 0.007 A anchor drift.
+#
+# Steps, with the repo function that does each:
+#   1. _build_covalent_adduct -- react the warhead (COVALENT_WARHEADS) with a
+#      side-chain mimic (CA-CB-SG for Cys, CA-CB-OG for Ser).
+#   2. _cov_rigid_receptor -- meeko's flexres split gives the rigid receptor.
+#      [measured] mk_prepare_receptor -f <chain>:<resnum> strips CA, CB and the
+#      side chain from the rigid PDBQT, keeping only that residue's backbone
+#      N/H/C/O, so the adduct's mimic atoms occupy those positions with nothing
+#      to clash against. Its companion _flex.pdbqt holds the residue's own side
+#      chain and is discarded -- the adduct replaces it.
+#   3. _cov_flexres_ligand -- meeko's covalent tether path superimposes the
+#      adduct on the residue and writes it as a BEGIN_RES flexible residue.
+#   4. _cov_envelope + _build_cov_gpf + _run_autogrid -- maps over the volume
+#      the tethered adduct can reach.
+#   5. _build_cov_dpf + _run_autodock4 -- the search. See _build_cov_dpf for
+#      the three DPF lines that carry the whole trick (`move empty`, `flexres`,
+#      and `unbound_energy 0.0`).
+#   6. _parse_cov_dlg + _cov_export_sdf -- energies and the pose.
+#
+# Scores are ordinary AutoDock4 binding free energies of the adduct, so unlike
+# the metal engines' maps-vs-Vina mix they ARE comparable between ligands. They
+# still are not comparable to blind_dock / dock_at_centroid affinities, which
+# come from Vina's own function. The geometric readout is the anchor drift,
+# reported per pose -- the covalent counterpart of the metal path's
+# coordination check.
+#
+# Why not Vina: [measured] Vina 1.2.7 refuses a flexres-only run ("ERROR:
+# Missing ligand(s)."), and it has no way to restrain an atom, so a
+# Vina-based tether can only be enforced by freezing the pose -- which rules
+# out any search. An earlier attempt along those lines (conformer ensemble +
+# clash screen + --score_only) is recorded in COVALENT_DOCKING.md; it placed
+# sotorasib's centroid 17.5 A from the crystal pose with 0% overlap, and
+# --local_only "refinement" slid the adduct 2.7-8.5 A off its anchor. The
+# lesson kept here: the tether has to be enforced BY THE DOCKING ENGINE.
+#
+# Residue syntax gotcha [measured]: meeko takes TWO different residue spellings
+# -- mk_prepare_receptor.py -f wants "<chain>:<resnum>" (e.g. "A:12") and
+# raises "missing residue in []" on anything else, while the covalent ligand
+# path's --rec_residue wants "<chain>:<resname>:<resnum>" (e.g. "A:CYS:12").
+# Both are used below, which is why they are called out here.
+#
+# Residue syntax gotcha [measured]: meeko takes TWO different residue spellings
+# -- mk_prepare_receptor.py -f wants "<chain>:<resnum>" (e.g. "A:12") and
+# raises "missing residue in []" on anything else, while the covalent ligand
+# path's --rec_residue wants "<chain>:<resname>:<resnum>" (e.g. "A:CYS:12").
+# This engine only uses the former.
+
+# AutoDock4: the engine that does the covalent search. Installed separately
+# from the Vina/ADFR envs because bioconda ships it for osx-64 only (it runs
+# under Rosetta, like the adfr-suite env):
+#   CONDA_SUBDIR=osx-64 conda create -n autodock4 -c bioconda autodock
+AUTODOCK4_BIN = os.path.expanduser(os.environ.get(
+    "AUTODOCK4_BIN", "~/miniforge3/envs/autodock4/bin/autodock4"))
+
+# Conformers embedded only to measure how far the tethered adduct can swing,
+# so the grid box can be made big enough (_cov_envelope). These are NOT
+# candidate poses -- AutoDock4 searches the torsions itself -- and the padding
+# is added around their combined bounding box. Module globals, NOT agent-facing
+# kwargs (see the agent-tool-signature gotcha comment near
+# FALLBACK_TO_SECOND_POCKET).
+COVALENT_ENVELOPE_CONFS = 20
+COVALENT_RMS_PRUNE = 0.5
+COVALENT_BOX_PADDING = 5.0
+# AutoDock4 search effort, the covalent tutorial's own values.
+COVALENT_GA_RUNS = 10
+COVALENT_GA_EVALS = 2500000
+# Anchor-atom RMSD (Angstroms) above which the covalent attachment is flagged
+# as having moved. AD4 pins the flexible residue's root so this should be ~0
+# ([measured] 0.007 A); the check exists to catch a broken setup, not to filter
+# poses.
+COVALENT_ANCHOR_DRIFT_WARN = 0.25
+# [measured] Each anchored conformer is scored by its own single-ligand Vina
+# call with --autobox, which sizes the grid to that one pose (~0.5 s, so a
+# default ensemble costs ~75 s per ligand). Two cheaper-looking alternatives
+# were tried and rejected: a single shared box around the whole ensemble needs
+# ~40 A edges (Vina warns past 27000 A^3) because a tethered adduct sweeps a
+# sphere around its anchor; and --batch mode writes NO "REMARK VINA RESULT"
+# line under --local_only, so scores never reach the output files, while
+# --score_only --batch refuses to run ("Need to specify an output directory"
+# even when --dir is given). Single-ligand runs print the score on stdout.
+# Radius (Angstroms) searched around a site centre by detect_nucleophiles.
+NUCLEOPHILE_SEARCH_RADIUS = 12.0
+
+# Nucleophilic side-chain atoms reported by detect_nucleophiles: resname ->
+# (atom name, chemistry label). Those also present in COVALENT_RESIDUES can be
+# docked; the rest are reported so the caller knows they are there.
+NUCLEOPHILE_ATOMS = {
+    "CYS": ("SG", "thiol"),
+    "SER": ("OG", "hydroxyl"),
+    "THR": ("OG1", "hydroxyl"),
+    "LYS": ("NZ", "amine"),
+    "TYR": ("OH", "phenol"),
+    "HIS": ("NE2", "imidazole"),
+}
+# Residues this engine can actually tether to: resname -> (anchor atom names in
+# alignment order, side-chain mimic SMILES, SMARTS locating the mimic in the
+# adduct, nucleophile element). Only residues whose CA-CB-nucleophile atoms
+# form a contiguous 3-atom chain are here: Lys/Tyr/His need a longer or cyclic
+# mimic whose own conformation would have to be sampled too (see
+# COVALENT_DOCKING.md "next steps").
+COVALENT_RESIDUES = {
+    "CYS": (("CA", "CB", "SG"), "CCS", "[CH3][CH2][SX2]", "S"),
+    "SER": (("CA", "CB", "OG"), "CCO", "[CH3][CH2][OX2]", "O"),
+}
+# Electrophilic warheads, in detection priority order: (name, detection SMARTS,
+# reaction template). "{nu}" is substituted with the target residue's
+# nucleophile element before the reaction is built, so one template serves both
+# Cys and Ser. Atom maps 5/6/7 are the mimic's CA/CB/nucleophile.
+# Irreversible warheads come first; the weaker/reversible nitrile and aldehyde
+# are last so that a ligand carrying both is tethered through the stronger one.
+# All carbon patterns are aliphatic (upper-case C), so aromatic ring carbonyls
+# and ring nitrogens cannot be mistaken for a warhead.
+COVALENT_WARHEADS = (
+    ("haloacetamide",
+     "[CX3](=[OX1])[CH2][Cl,Br,I]",
+     "[CX3:1](=[OX1:2])[CH2:3][Cl,Br,I:4].[CH3:5][CH2:6][{nu}X2H1:7]"
+     ">>[C:1](=[O:2])[C:3][{nu}:7][CH2:6][CH3:5]"),
+    ("michael acceptor",
+     "[CX3](=[OX1])[CX3]=[CX3]",
+     "[CX3:1](=[OX1:2])[CX3:3]=[CX3:4].[CH3:5][CH2:6][{nu}X2H1:7]"
+     ">>[C:1](=[O:2])[C:3][C:4][{nu}:7][CH2:6][CH3:5]"),
+    ("vinyl sulfone",
+     "[SX4](=[OX1])(=[OX1])[CX3]=[CX3]",
+     "[SX4:1](=[OX1:2])(=[OX1:8])[CX3:3]=[CX3:4].[CH3:5][CH2:6][{nu}X2H1:7]"
+     ">>[S:1](=[O:2])(=[O:8])[C:3][C:4][{nu}:7][CH2:6][CH3:5]"),
+    ("epoxide",
+     "[CX4;H1,H2]1[OX2][CX4;H1,H2]1",
+     "[CX4:3]1[OX2:2][CX4:4]1.[CH3:5][CH2:6][{nu}X2H1:7]"
+     ">>[C:3]([O:2])[C:4][{nu}:7][CH2:6][CH3:5]"),
+    ("nitrile",
+     "[CX2]#[NX1]",
+     "[CX2:1]#[NX1:2].[CH3:5][CH2:6][{nu}X2H1:7]"
+     ">>[C:1](=[N:2])[{nu}:7][CH2:6][CH3:5]"),
+    ("aldehyde",
+     "[CX3H1](=[OX1])[#6]",
+     "[CX3H1:1](=[OX1:2])[#6:3].[CH3:5][CH2:6][{nu}X2H1:7]"
+     ">>[C:1]([O:2])([#6:3])[{nu}:7][CH2:6][CH3:5]"),
+)
+# Which atom of each warhead's detection SMARTS is the electrophilic carbon the
+# covalent bond forms at: the beta carbon of a Michael acceptor or vinyl
+# sulfone, the CH2 of a haloacetamide, the attacked carbon of an epoxide, and
+# the nitrile/aldehyde carbon itself. Used by check_warhead_geometry to point
+# at the reacting atom, and consistent with where each reaction template above
+# attaches the nucleophile.
+WARHEAD_REACTING_ATOM = {
+    "haloacetamide": 2, "michael acceptor": 3, "vinyl sulfone": 4,
+    "epoxide": 2, "nitrile": 0, "aldehyde": 0,
+}
+
+
+def detect_nucleophiles(pdb_path, center=None, radius=NUCLEOPHILE_SEARCH_RADIUS):
+    """Find nucleophilic side-chain atoms (Cys SG, Ser OG, Lys NZ, ...) in a PDB.
+
+    A pure-PDB scan of ATOM records against NUCLEOPHILE_ATOMS. When `center` is
+    given, only atoms within `radius` of it are returned, which is the useful
+    mode: a protein has dozens of surface cysteines and only the ones lining
+    the site of interest are candidate covalent targets.
+
+    Returns a list of dicts {resname, chain, resseq, atom, label, xyz, dist,
+    dockable} sorted by distance from `center` (or by chain/resseq when no
+    centre is given). `dockable` is True when this engine can tether to the
+    residue, i.e. it is in COVALENT_RESIDUES.
+    """
+    if not os.path.exists(pdb_path):
+        raise DockError(f"receptor not found: {pdb_path}")
+    out = []
+    with open(pdb_path) as fh:
+        for line in fh:
+            if not line.startswith("ATOM"):
+                continue
+            resname = line[17:20].strip().upper()
+            want = NUCLEOPHILE_ATOMS.get(resname)
+            if want is None or line[12:16].strip() != want[0]:
+                continue
+            try:
+                xyz = [float(line[30:38]), float(line[38:46]), float(line[46:54])]
+            except ValueError:
+                continue
+            d = None
+            if center is not None:
+                d = math.sqrt(sum((a - b) ** 2 for a, b in zip(xyz, center)))
+                if d > radius:
+                    continue
+            out.append({"resname": resname, "chain": line[21].strip(),
+                        "resseq": line[22:26].strip(), "atom": want[0],
+                        "label": want[1], "xyz": xyz, "dist": d,
+                        "dockable": resname in COVALENT_RESIDUES})
+    if center is not None:
+        out.sort(key=lambda r: r["dist"])
+    else:
+        out.sort(key=lambda r: (r["chain"], int(r["resseq"] or 0)))
+    return out
+
+
+def detect_nucleophiles_agent(receptor_pdb: str, center_x: float,
+                              center_y: float, center_z: float) -> str:
+    """
+    List the nucleophilic amino-acid side chains (cysteine SG, serine OG,
+    threonine OG1, lysine NZ, tyrosine OH, histidine NE2) near a binding site
+    in a receptor PDB, with each one's residue name, chain, residue number,
+    coordinates and distance from the site centre. These are the candidate
+    attachment points for COVALENT docking. Call this before
+    dock_covalent_agent: pass the site centre you already know (for example a
+    co-crystallized ligand centroid from find_ligand_centroids), then pass the
+    chain and residue number of the chosen residue to dock_covalent_agent.
+    Residues marked "dockable" are the ones covalent docking supports.
+
+    Args:
+        receptor_pdb: path to a receptor PDB file.
+        center_x: binding-site centre X coordinate in Angstroms.
+        center_y: binding-site centre Y coordinate in Angstroms.
+        center_z: binding-site centre Z coordinate in Angstroms.
+    Returns:
+        A report listing each nearby nucleophilic residue, closest first;
+        "none" if there are no such residues near that centre.
+    """
+    center = [float(center_x), float(center_y), float(center_z)]
+    try:  # return failures as text, not exceptions -- see dock_covalent_agent
+        hits = detect_nucleophiles(receptor_pdb, center=center)
+    except DockError as e:
+        return f"could not scan for nucleophiles: {e}"
+    if not hits:
+        return (f"no nucleophilic side chains within "
+                f"{NUCLEOPHILE_SEARCH_RADIUS:.0f} A of "
+                f"({center[0]:.3f}, {center[1]:.3f}, {center[2]:.3f}) in "
+                f"{os.path.abspath(receptor_pdb)}")
+    lines = [f"Nucleophilic side chains within {NUCLEOPHILE_SEARCH_RADIUS:.0f} A "
+             f"of ({center[0]:.3f}, {center[1]:.3f}, {center[2]:.3f}) in "
+             f"{os.path.abspath(receptor_pdb)}:"]
+    for h in hits:
+        lines.append(
+            f"  {h['resname']} {h['chain']}{h['resseq']} {h['atom']} "
+            f"({h['label']}) at ({h['xyz'][0]:.3f}, {h['xyz'][1]:.3f}, "
+            f"{h['xyz'][2]:.3f})  {h['dist']:.2f} A from centre  "
+            f"{'dockable' if h['dockable'] else 'not dockable by this engine'}")
+    dock = [h for h in hits if h["dockable"]]
+    lines.append("")
+    if dock:
+        b = dock[0]
+        lines.append(f"Closest dockable residue: {b['resname']} "
+                     f"{b['chain']}{b['resseq']} -- pass chain='{b['chain']}', "
+                     f"resseq={b['resseq']} to dock_covalent_agent")
+    else:
+        lines.append("No dockable (Cys/Ser) residue near this site; covalent "
+                     "docking is not available here.")
+    return "\n".join(lines)
+
+
+def _residue_anchor(pdb_path, chain, resseq):
+    """Anchor coordinates for a covalent target residue.
+
+    Returns (resname, [xyz, ...]) with the coordinates in COVALENT_RESIDUES
+    alignment order (CA, CB, then the nucleophile atom). Raises DockError when
+    the residue is absent, is not a supported type, or is missing a side-chain
+    atom (e.g. a truncated or alternate-conformation residue).
+    """
+    chain = (chain or "").strip()
+    resseq = str(resseq).strip()
+    found = {}
+    resname = None
+    with open(pdb_path) as fh:
+        for line in fh:
+            if not line.startswith("ATOM"):
+                continue
+            if line[21].strip() != chain or line[22:26].strip() != resseq:
+                continue
+            resname = line[17:20].strip().upper()
+            found[line[12:16].strip()] = [float(line[30:38]), float(line[38:46]),
+                                          float(line[46:54])]
+    if resname is None:
+        raise DockError(f"residue {chain}:{resseq} not found in {pdb_path}; "
+                        f"call detect_nucleophiles_agent for valid residues")
+    if resname not in COVALENT_RESIDUES:
+        supported = "/".join(sorted(COVALENT_RESIDUES))
+        raise DockError(f"residue {chain}:{resseq} is {resname}; covalent "
+                        f"docking supports {supported} only")
+    names = COVALENT_RESIDUES[resname][0]
+    missing = [n for n in names if n not in found]
+    if missing:
+        raise DockError(f"{resname} {chain}{resseq} is missing side-chain "
+                        f"atom(s) {','.join(missing)} in the PDB")
+    return resname, [found[n] for n in names]
+
+
+def _build_covalent_adduct(smiles, resname):
+    """React a ligand's warhead with a side-chain mimic; return the adduct.
+
+    Returns (adduct mol, warhead name, (ca_idx, cb_idx, nu_idx)) where the
+    indices locate the mimic atoms in the adduct. The first warhead in
+    COVALENT_WARHEADS that matches the ligand is used.
+
+    Raises DockError when the SMILES is unparseable, when no known warhead is
+    present, or when the mimic cannot be located unambiguously in the adduct
+    (which happens if the ligand itself already contains an ethylthio /
+    ethoxy group -- the report says so rather than tethering the wrong atom).
+    """
+    from rdkit import Chem
+    from rdkit.Chem import AllChem
+
+    lig = Chem.MolFromSmiles(smiles)
+    if lig is None:
+        raise DockError(f"RDKit could not parse SMILES: {smiles}")
+    names, frag_smi, mimic_smarts, nu = COVALENT_RESIDUES[resname]
+    frag = Chem.MolFromSmiles(frag_smi)
+    mimic = Chem.MolFromSmarts(mimic_smarts)
+
+    for wname, detect, template in COVALENT_WARHEADS:
+        patt = Chem.MolFromSmarts(detect)
+        if patt is None or not lig.HasSubstructMatch(patt):
+            continue
+        rxn = AllChem.ReactionFromSmarts(template.format(nu=nu))
+        try:
+            products = rxn.RunReactants((lig, frag))
+        except Exception as e:
+            raise DockError(f"{wname} reaction failed for {smiles}: {e}")
+        for prodset in products:
+            add = prodset[0]
+            try:
+                Chem.SanitizeMol(add)
+            except Exception:
+                continue
+            hits = add.GetSubstructMatches(mimic)
+            if len(hits) == 1:
+                return add, wname, hits[0]
+            if hits:
+                raise DockError(
+                    f"the {resname} side-chain mimic is ambiguous in the "
+                    f"{wname} adduct of {smiles} ({len(hits)} matches for "
+                    f"{mimic_smarts}): the ligand already contains that "
+                    f"group, so the covalent tether cannot be placed")
+        raise DockError(f"{wname} detected in {smiles} but the adduct would "
+                        f"not sanitize")
+    known = ", ".join(w[0] for w in COVALENT_WARHEADS)
+    raise DockError(f"no covalent warhead found in {smiles}; recognised "
+                    f"warheads are: {known}")
+
+
+def _cov_rigid_receptor(pdb_path, chain, resseq, out_root, anchor,
+                        overwrite=False):
+    """Rigid receptor PDBQT with the target residue's side chain removed.
+
+    Runs meeko's mk_prepare_receptor.py with the target residue declared
+    FLEXIBLE (-f <chain>:<resnum>), which moves CA/CB/side chain out of the
+    rigid file; the companion _flex.pdbqt it writes holds the residue's OWN
+    side chain and is deliberately discarded, because the covalent adduct
+    takes its place as the flexible residue. Returns the rigid PDBQT path,
+    cached across ligands.
+    """
+    script = _meeko_script("mk_prepare_receptor.py")
+    if script is None:
+        raise DockError("meeko (mk_prepare_receptor.py) not found; "
+                        "pip install meeko")
+    rigid = out_root + "_rigid.pdbqt"
+    if os.path.exists(rigid) and not overwrite:
+        return rigid
+
+    # Strip every HETATM first. This is NOT just tidying: a structure fetched
+    # for redocking still contains the co-crystallized inhibitor, and for a
+    # covalent complex that ligand sits in the very pocket being docked into,
+    # so leaving it in makes the result meaningless. The official tutorial is
+    # explicit -- "if a covalent ligand is already bound to the residue in the
+    # protein structure, it must be removed!". It also happens to be what
+    # meeko needs: [measured] on the raw 6OIM it aborts with "Input residues
+    # {'A:302': 'GDP', 'A:303': 'MOV'} not in residue_templates", MOV being
+    # the bound sotorasib adduct itself.
+    # Waters and cofactors go too (GDP/Mg here), which is the honest
+    # limitation: a cofactor that genuinely shapes the site is not represented.
+    # All protein chains are kept, since a neighbouring chain can form part of
+    # the pocket.
+    protein_pdb = out_root + "_protein.pdb"
+    n_atom = n_het = 0
+    with open(pdb_path) as src, open(protein_pdb, "w") as dst:
+        for line in src:
+            if line.startswith("ATOM"):
+                dst.write(line)
+                n_atom += 1
+            elif line.startswith("HETATM"):
+                n_het += 1
+            elif line.startswith(("TER", "END")):
+                dst.write(line)
+    if n_atom == 0:
+        try:
+            os.remove(protein_pdb)
+        except OSError:
+            pass
+        raise DockError(f"no ATOM (protein) records in {pdb_path}")
+    print(f"vina_dock: covalent receptor prep: kept {n_atom} protein atoms, "
+          f"dropped {n_het} HETATM (ligands/waters/cofactors)")
+    # --default_altloc A: [measured] meeko refuses any structure containing a
+    # residue with alternate locations ("Error: Creation of data structure for
+    # receptor failed ... Residues with alternate location"), common in
+    # high-resolution entries (4G5J has A:970). Altloc A is the convention.
+    # --allow_bad_res: [measured] meeko otherwise aborts the whole receptor
+    # when any residue fails template matching ("No template matched for
+    # residue_key='A:640'"), which killed 5P9J (BTK) on surface Glu/Ser with
+    # incomplete side chains; this drops those residues instead. Safe here
+    # only because _residue_anchor validates the TARGET residue against the
+    # PDB beforehand, so a truncated target is reported rather than silently
+    # deleted -- but the rigid receptor can be missing odd surface residues.
+    # meeko's -f takes "<chain>:<resnum>", NOT the "<chain>:<resname>:<resnum>"
+    # spelling the covalent ligand path wants (see the module comment above).
+    try:
+        _run([sys.executable, script, "-i", protein_pdb, "-o", out_root, "-p",
+              "-f", f"{chain}:{resseq}",
+              "--default_altloc", "A", "--allow_bad_res",
+              "--box_center", f"{anchor[0]:.3f}", f"{anchor[1]:.3f}",
+              f"{anchor[2]:.3f}",
+              "--box_size", "30", "30", "30"],
+             f"meeko receptor prep (flexres {chain}:{resseq})")
+    finally:
+        try:
+            os.remove(protein_pdb)
+        except OSError:
+            pass
+    if not os.path.exists(rigid):
+        raise DockError(f"meeko wrote no rigid receptor PDBQT: {rigid}")
+    try:
+        os.remove(out_root + "_flex.pdbqt")
+    except OSError:
+        pass
+    return rigid
+
+
+def _cov_envelope(adduct, tether, anchor, n_confs=None):
+    """Grid box covering everywhere the tethered adduct can reach.
+
+    AutoDock4 searches the adduct's torsions itself, so no pose sampling
+    happens here -- conformers are embedded ONLY to find out how far the
+    tethered ligand can swing, so the grid box can be made big enough. Each
+    conformer is superimposed on the target residue's real CA/CB/nucleophile
+    coordinates and the union of their bounding boxes, plus
+    COVALENT_BOX_PADDING, becomes the box. A box that does not cover the
+    reachable volume would silently truncate the search (AD4 charges
+    `extnrg` for leaving it).
+
+    Returns (center, edge) with a cubic edge.
+    """
+    from rdkit import Chem
+    from rdkit.Chem import AllChem, rdMolAlign, rdGeometry
+
+    n_confs = n_confs or COVALENT_ENVELOPE_CONFS
+    ref = Chem.AddHs(Chem.MolFromSmiles("CCS"))
+    if AllChem.EmbedMolecule(ref, randomSeed=1) != 0:
+        raise DockError("could not embed the covalent anchor reference")
+    rc = ref.GetConformer()
+    for i in range(3):
+        rc.SetAtomPosition(i, rdGeometry.Point3D(*[float(v) for v in anchor[i]]))
+
+    mol = Chem.AddHs(adduct)
+    params = AllChem.ETKDGv3()
+    params.randomSeed = 0xf00d
+    params.pruneRmsThresh = COVALENT_RMS_PRUNE
+    cids = list(AllChem.EmbedMultipleConfs(mol, numConfs=n_confs, params=params))
+    if not cids:
+        raise DockError("RDKit could not embed any conformer of the adduct")
+
+    amap = [(tether[0], 0), (tether[1], 1), (tether[2], 2)]
+    lo = [float("inf")] * 3
+    hi = [float("-inf")] * 3
+    for cid in cids:
+        rdMolAlign.AlignMol(mol, ref, prbCid=cid, atomMap=amap)
+        conf = mol.GetConformer(cid)
+        for i in range(mol.GetNumAtoms()):
+            p = conf.GetAtomPosition(i)
+            for k, v in enumerate((p.x, p.y, p.z)):
+                lo[k] = min(lo[k], v)
+                hi[k] = max(hi[k], v)
+    center = [(lo[k] + hi[k]) / 2.0 for k in range(3)]
+    edge = max(hi[k] - lo[k] for k in range(3)) + 2 * COVALENT_BOX_PADDING
+    # AutoGrid caps a map dimension at 128 points
+    edge = min(edge, 126 * AUTOGRID_SPACING)
+    return center, edge
+
+
+def _cov_flexres_ligand(adduct, resname, chain, resseq, receptor_pdb,
+                        out_pdbqt, work, idx):
+    """Covalent adduct -> flexible-residue PDBQT, via meeko's tether path.
+
+    This is the official protocol's ligand side: meeko superimposes the
+    adduct's side-chain mimic onto the target residue's CA/CB and writes the
+    result as a BEGIN_RES flexible residue (its
+    PDBQTWriterLegacy.adapt_pdbqt_for_autodock4_flexres step), which is
+    exactly the `flexres` input AutoDock4 wants. meeko aligns on CA,CB only
+    (force_CA_CB is hardcoded in CovalentBuilder), so only a 3D seed
+    conformer is needed here -- AD4 samples the torsions.
+    """
+    from rdkit import Chem
+    from rdkit.Chem import AllChem
+
+    script = _meeko_script("mk_prepare_ligand.py")
+    if script is None:
+        raise DockError("meeko (mk_prepare_ligand.py) not found; pip install meeko")
+    mol = Chem.AddHs(adduct)
+    if AllChem.EmbedMolecule(mol, randomSeed=0xf00d) != 0:
+        raise DockError("RDKit could not embed the covalent adduct")
+    AllChem.MMFFOptimizeMolecule(mol, maxIters=500)
+    mol.SetProp("_Name", f"cov{idx}")
+    sdf = os.path.join(work, f"adduct_{idx}.sdf")
+    w = Chem.SDWriter(sdf)
+    try:
+        w.write(mol)
+    finally:
+        w.close()
+    _run([sys.executable, script, "-i", sdf, "-o", out_pdbqt,
+          "--receptor", receptor_pdb,
+          "--rec_residue", f"{chain}:{resname}:{resseq}",
+          "--tether_smarts", COVALENT_RESIDUES[resname][2],
+          "--tether_smarts_indices", "1", "2"],
+         f"meeko covalent ligand prep (mol {idx})")
+    if not os.path.exists(out_pdbqt):
+        raise DockError(f"meeko wrote no covalent ligand PDBQT: {out_pdbqt}")
+    return out_pdbqt
+
+
+def _pdbqt_types(path):
+    """Atom types present in a PDBQT, in first-seen order."""
+    seen = []
+    with open(path) as fh:
+        for line in fh:
+            if line.startswith(("ATOM", "HETATM")):
+                t = line[77:79].strip()
+                if t and t not in seen:
+                    seen.append(t)
+    return seen
+
+
+def _pdbqt_torsdof(path):
+    """Torsional degrees of freedom of a (flex)PDBQT."""
+    tors = None
+    branches = 0
+    with open(path) as fh:
+        for line in fh:
+            if line.startswith("TORSDOF"):
+                try:
+                    tors = int(line.split()[1])
+                except (IndexError, ValueError):
+                    pass
+            elif line.startswith("BRANCH"):
+                branches += 1
+    return tors if tors is not None else branches
+
+
+def _build_cov_gpf(rec_pdbqt, flexres_pdbqt, gpf_path, center, edge):
+    """AutoGrid4 GPF for covalent flexres docking.
+
+    Plain AD4 maps -- unlike the metal path's _build_ad4map_gpf there are no
+    nbp site terms and no custom parameter file. The map set must cover every
+    atom type in the FLEXRES (the adduct), because in this protocol the
+    flexible residue is the ligand.
+    """
+    rec_types = _pdbqt_types(rec_pdbqt)
+    lig_types = _pdbqt_types(flexres_pdbqt)
+    if not lig_types:
+        raise DockError(f"no atom types parsed from {flexres_pdbqt}")
+    base = os.path.basename(rec_pdbqt)[:-6]
+    npts = int(round(edge / AUTOGRID_SPACING))
+    lines = [
+        f"npts {npts} {npts} {npts}",
+        f"gridfld {base}.maps.fld",
+        f"spacing {AUTOGRID_SPACING}",
+        f"receptor_types {' '.join(rec_types)}",
+        f"ligand_types {' '.join(lig_types)}",
+        f"receptor {os.path.basename(rec_pdbqt)}",
+        f"gridcenter {center[0]:.3f} {center[1]:.3f} {center[2]:.3f}",
+        "smooth 0.5",
+    ]
+    lines += [f"map {base}.{t}.map" for t in lig_types]
+    lines += [f"elecmap {base}.e.map", f"dsolvmap {base}.d.map",
+              "dielectric -0.1465"]
+    with open(gpf_path, "w") as fh:
+        fh.write("\n".join(lines) + "\n")
+    return lig_types, base
+
+
+def _build_cov_dpf(flexres_pdbqt, maps_base, lig_types, dpf_path, center,
+                   torsdof, ga_runs=None, ga_evals=None):
+    """The official covalent docking DPF (AutoDock4 flexible side chain).
+
+    Follows the adCovalentDockResidue tutorial's generated DPF exactly. Three
+    lines carry the whole trick and all three are easy to miss:
+      move empty         -- there is NO real ligand; `empty` is a zero-byte
+                            file, and the covalent adduct enters through
+                            `flexres` instead. AD4 holds a flexible residue's
+                            ROOT atom fixed, which is what makes the covalent
+                            attachment unbreakable [measured drift 0.007 A].
+      flexres <adduct>    -- the adduct as the flexible residue.
+      unbound_energy 0.0  -- [measured] ESSENTIAL. The default
+                            `unbound_model bound` sets the unbound reference
+                            equal to the bound energy, so every pose scores
+                            exactly +0.00 kcal/mol and the ranking comes back
+                            as nan. With unbound_energy 0.0 the score is the
+                            adduct-receptor interaction energy.
+    `rmsdatoms all`, which the tutorial README suggests adding so flexres
+    atoms count toward RMSD/clustering, is NOT written: [measured] AutoDock4
+    4.2.6 rejects it ("FATAL ERROR: DPF> rmsdatoms all / Unrecognized keyword")
+    and the tutorial's own shipped DPF omits it too. It affects only RMSD
+    reporting, not energies.
+    """
+    ga_runs = ga_runs or COVALENT_GA_RUNS
+    ga_evals = ga_evals or COVALENT_GA_EVALS
+    lines = [
+        "autodock_parameter_version 4.2",
+        "outlev 1",
+        "intelec",
+        "seed pid time",
+        f"ligand_types {' '.join(lig_types)}",
+        f"fld {maps_base}.maps.fld",
+    ]
+    lines += [f"map {maps_base}.{t}.map" for t in lig_types]
+    lines += [
+        f"elecmap {maps_base}.e.map",
+        f"desolvmap {maps_base}.d.map",
+        "move empty",
+        f"flexres {os.path.basename(flexres_pdbqt)}",
+        f"about {center[0]:.3f} {center[1]:.3f} {center[2]:.3f}",
+        "tran0 random",
+        "quaternion0 random",
+        "dihe0 random",
+        f"torsdof {torsdof}",
+        "rmstol 2.0",
+        "extnrg 1000.0",
+        "e0max 0.0 10000",
+        "ga_pop_size 150",
+        f"ga_num_evals {ga_evals}",
+        "ga_num_generations 27000",
+        "ga_elitism 1",
+        "ga_mutation_rate 0.02",
+        "ga_crossover_rate 0.8",
+        "ga_window_size 10",
+        "ga_cauchy_alpha 0.0",
+        "ga_cauchy_beta 1.0",
+        "set_ga",
+        "sw_max_its 300",
+        "sw_max_succ 4",
+        "sw_max_fail 4",
+        "sw_rho 1.0",
+        "sw_lb_rho 0.01",
+        "ls_search_freq 0.06",
+        "set_psw1",
+        "unbound_energy 0.0",
+        f"ga_run {ga_runs}",
+        "analysis",
+    ]
+    with open(dpf_path, "w") as fh:
+        fh.write("\n".join(lines) + "\n")
+    return dpf_path
+
+
+def _run_autodock4(dpf_path, dlg_path, cwd=None):
+    """Run AutoDock4 on a DPF, raising DockError with the log tail on failure."""
+    if not os.path.exists(AUTODOCK4_BIN):
+        raise DockError(
+            f"autodock4 not found: {AUTODOCK4_BIN} (set AUTODOCK4_BIN, or "
+            f"create the env: CONDA_SUBDIR=osx-64 conda create -n autodock4 "
+            f"-c bioconda autodock)")
+    res = subprocess.run([AUTODOCK4_BIN, "-p", os.path.basename(dpf_path),
+                          "-l", os.path.basename(dlg_path)],
+                         capture_output=True, text=True, cwd=cwd)
+    if res.returncode != 0:
+        tail = ""
+        if os.path.exists(dlg_path):
+            with open(dlg_path) as fh:
+                tail = "\n".join(fh.read().splitlines()[-8:])
+        raise DockError(f"autodock4 failed (exit {res.returncode})\n"
+                        f"  stderr: {res.stderr.strip()}\n  dlg tail: {tail}")
+    return dlg_path
+
+
+def _parse_cov_dlg(dlg_path):
+    """Docked poses from an AutoDock4 DLG, best energy first.
+
+    Returns a list of dicts {energy, ki, atoms} where atoms is a list of
+    (name, pdbqt type, xyz). Only DOCKED records are read, so the per-run
+    trajectory output is ignored.
+    """
+    if not os.path.exists(dlg_path):
+        raise DockError(f"no DLG written: {dlg_path}")
+    poses = []
+    cur = None
+    energy = ki = None
+    with open(dlg_path) as fh:
+        for line in fh:
+            if not line.startswith("DOCKED:"):
+                continue
+            body = line[8:]
+            if body.startswith("MODEL"):
+                cur, energy, ki = [], None, None
+            elif body.startswith("ENDMDL"):
+                if cur and energy is not None:
+                    poses.append({"energy": energy, "ki": ki, "atoms": cur})
+                cur = None
+            elif "Estimated Free Energy of Binding" in body:
+                try:
+                    energy = float(body.split("=")[1].split("kcal")[0])
+                except (IndexError, ValueError):
+                    pass
+            elif "Estimated Inhibition Constant" in body:
+                try:
+                    ki = body.split("=")[1].strip().split("  ")[0].strip()
+                except IndexError:
+                    pass
+            elif body.startswith(("ATOM", "HETATM")) and cur is not None:
+                try:
+                    cur.append((body[12:16].strip(), body[77:79].strip(),
+                                (float(body[30:38]), float(body[38:46]),
+                                 float(body[46:54]))))
+                except ValueError:
+                    pass
+    poses.sort(key=lambda p: p["energy"])
+    return poses
+
+
+def _cov_anchor_drift(pose, anchor_names, anchor_xyz):
+    """RMSD of a docked pose's anchor atoms from the receptor's own.
+
+    AD4 pins a flexible residue's root, so this should be ~0; it is kept as a
+    cheap assertion that the covalent attachment really did hold, and is the
+    direct analogue of the metal path's coordination check.
+    """
+    byname = {}
+    for name, _t, xyz in pose["atoms"]:
+        byname.setdefault(name, xyz)
+    got = [(n, byname[n], a) for n, a in zip(anchor_names, anchor_xyz)
+           if n in byname]
+    if not got:
+        return None
+    tot = sum(sum((p - q) ** 2 for p, q in zip(x, a)) for _n, x, a in got)
+    return math.sqrt(tot / len(got))
+
+
+def _cov_export_sdf(dlg_path, out_sdf, cwd=None):
+    """DLG -> SDF via meeko's mk_export.py (the official export step).
+
+    mk_export writes the cluster leads, which AD4 orders best-energy first, so
+    the first record is the reported pose. -k keeps the covalent ligand (the
+    flexible residue) rather than dropping it as receptor. Returns True on
+    success; a failure is reported rather than raised, because the energies
+    and geometry have already been obtained from the DLG.
+    """
+    script = _meeko_script("mk_export.py")
+    if script is None:
+        return False
+    res = subprocess.run([sys.executable, script, os.path.basename(dlg_path),
+                          "-s", out_sdf, "-k"],
+                         capture_output=True, text=True, cwd=cwd)
+    if res.returncode != 0 or not os.path.exists(out_sdf):
+        # cluster leads are absent if `analysis` produced no clustering
+        res = subprocess.run([sys.executable, script,
+                              os.path.basename(dlg_path), "-s", out_sdf,
+                              "-k", "--all_dlg_poses"],
+                             capture_output=True, text=True, cwd=cwd)
+    return res.returncode == 0 and os.path.exists(out_sdf)
+
+
+def dock_covalent(receptor_pdb, smiles_list, chain, resseq, ga_runs=None,
+                  ga_evals=None, overwrite_receptor=False, verbose=False):
+    """Covalently dock ligands onto a Cys/Ser side chain with AutoDock4.
+
+    Implements the official AutoDock "flexible side chain" covalent docking
+    protocol (Bianco, Forli, Goodsell & Olson, Protein Sci 2015). For each
+    ligand: the electrophilic warhead is reacted in silico with a mimic of
+    the target side chain, meeko superimposes the adduct on the residue and
+    writes it as a flexible residue, AutoGrid builds maps over the volume the
+    tethered adduct can reach, and AutoDock4 runs a full Lamarckian GA search
+    of the adduct's torsions with its root atom pinned to the residue.
+
+    Because AD4 holds a flexible residue's root fixed, the covalent
+    attachment cannot move during the search -- the scores are ordinary AD4
+    binding free energies and ARE comparable between ligands.
+
+    Persisted artefacts (next to the input PDB):
+      <stem>_cov<chain><resseq>_rigid.pdbqt   rigid receptor (cached)
+      <stem>_cov<i>.sdf                       best pose for molecule i
+
+    Args:
+        receptor_pdb: path to a receptor PDB file.
+        smiles_list: iterable of ligand SMILES (the FREE, unreacted drug --
+            the warhead is reacted by this function, so pass e.g. the
+            acrylamide, not the thioether adduct).
+        chain: chain identifier of the target residue (e.g. "A").
+        resseq: residue number of the target residue (e.g. 12).
+        ga_runs, ga_evals: AutoDock4 search effort (defaults
+            COVALENT_GA_RUNS / COVALENT_GA_EVALS, the tutorial's values).
+        overwrite_receptor: rebuild the cached rigid receptor PDBQT.
+        verbose: surface meeko/AutoGrid/AutoDock progress.
+
+    Returns:
+        A multi-line string report: target residue, warhead per ligand, the
+        AD4 binding energy and Ki, the anchor-drift check, and the pose SDF.
+
+    Raises:
+        DockError for setup failures affecting every molecule (receptor or
+        residue missing, unsupported residue, meeko/AutoGrid/AutoDock4
+        absent). Per-molecule failures are reported, not raised.
+    """
+    print("vina_dock: covalent docking (AutoDock4 flexible side chain)...")
+    print('==============================================')
+
+    if isinstance(smiles_list, str):
+        smiles_list = [smiles_list]
+    if not os.path.exists(receptor_pdb):
+        raise DockError(f"receptor not found: {receptor_pdb}")
+    receptor_pdb = os.path.abspath(receptor_pdb)
+    stem = os.path.splitext(receptor_pdb)[0]
+    chain = (chain or "").strip()
+    resseq = str(resseq).strip()
+
+    resname, anchor = _residue_anchor(receptor_pdb, chain, resseq)
+    anchor_names = COVALENT_RESIDUES[resname][0]
+    if not os.path.exists(AUTODOCK4_BIN):
+        raise DockError(
+            f"autodock4 not found: {AUTODOCK4_BIN} (set AUTODOCK4_BIN, or "
+            f"create the env: CONDA_SUBDIR=osx-64 conda create -n autodock4 "
+            f"-c bioconda autodock)")
+    if not os.path.exists(AUTOGRID_BIN):
+        raise DockError(f"autogrid4 not found: {AUTOGRID_BIN} "
+                        f"(set AUTOGRID_BIN or create the adfr-suite env)")
+
+    results = []  # (idx, smi, warhead, metrics|None, sdf, status, detail)
+    with contextlib.ExitStack() as stack:
+        if not verbose:
+            stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+            stack.enter_context(contextlib.redirect_stderr(io.StringIO()))
+            try:
+                from rdkit import RDLogger
+                RDLogger.DisableLog("rdApp.*")
+                stack.callback(RDLogger.EnableLog, "rdApp.*")
+            except Exception:
+                pass
+
+        rec_root = f"{stem}_cov{chain}{resseq}"
+        rec_rigid = _cov_rigid_receptor(receptor_pdb, chain, resseq, rec_root,
+                                        anchor[1], overwrite=overwrite_receptor)
+        work = tempfile.mkdtemp(prefix="dock_cov_")
+        try:
+            # AD4/AutoGrid reference their inputs by basename, so everything
+            # for a run lives in one working directory.
+            work_rec = os.path.join(work, "rec_rigid.pdbqt")
+            shutil.copy(rec_rigid, work_rec)
+            open(os.path.join(work, "empty"), "w").close()  # the `move empty`
+
+            for idx, smi in enumerate(smiles_list):
+                sdf_out = f"{stem}_cov{idx}.sdf"
+                warhead = None
+                try:
+                    adduct, warhead, tether = _build_covalent_adduct(smi, resname)
+                    flex = os.path.join(work, f"cov_{idx}.pdbqt")
+                    _cov_flexres_ligand(adduct, resname, chain, resseq,
+                                        receptor_pdb, flex, work, idx)
+                    center, edge = _cov_envelope(adduct, tether, anchor)
+                    gpf = os.path.join(work, f"grid_{idx}.gpf")
+                    lig_types, maps_base = _build_cov_gpf(
+                        work_rec, flex, gpf, center, edge)
+                    _run_autogrid(gpf, os.path.join(work, f"grid_{idx}.glg"),
+                                  cwd=work)
+                    dpf = os.path.join(work, f"dock_{idx}.dpf")
+                    torsdof = _pdbqt_torsdof(flex)
+                    _build_cov_dpf(flex, maps_base, lig_types, dpf, center,
+                                   torsdof, ga_runs=ga_runs, ga_evals=ga_evals)
+                    dlg = os.path.join(work, f"dock_{idx}.dlg")
+                    _run_autodock4(dpf, dlg, cwd=work)
+                    poses = _parse_cov_dlg(dlg)
+                    if not poses:
+                        results.append((idx, smi, warhead, None, sdf_out,
+                                        "failed",
+                                        "AutoDock4 produced no docked poses"))
+                        continue
+                    best = poses[0]
+                    drift = _cov_anchor_drift(best, anchor_names, anchor)
+                    wrote = _cov_export_sdf(dlg, sdf_out, cwd=work)
+                    met = {"energy": best["energy"], "ki": best["ki"],
+                           "drift": drift, "n_poses": len(poses),
+                           "torsdof": torsdof, "box": edge}
+                    results.append((idx, smi, warhead, met,
+                                    sdf_out if wrote else None, "ok",
+                                    f"{warhead}; {len(poses)} poses, "
+                                    f"{torsdof} torsions, "
+                                    f"{edge:.0f} A box"))
+                except DockError as e:
+                    results.append((idx, smi, warhead, None, sdf_out,
+                                    "failed", str(e)))
+                except Exception as e:
+                    results.append((idx, smi, warhead, None, sdf_out,
+                                    "error", f"{type(e).__name__}: {e}"))
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
+
+    lines = ["Covalent docking report (AutoDock4 flexible side chain)",
+             f"  receptor:       {receptor_pdb}",
+             f"  target residue: {resname} {chain}{resseq} "
+             f"({anchor_names[2]} at "
+             f"({anchor[2][0]:.3f}, {anchor[2][1]:.3f}, {anchor[2][2]:.3f}))",
+             f"  rigid receptor: {rec_rigid}",
+             "  engine:         ad4-cov (official flexible-side-chain covalent "
+             "protocol: RDKit warhead reaction -> meeko tether -> AutoGrid -> "
+             "AutoDock4 LGA)",
+             f"  autodock4:      {AUTODOCK4_BIN}",
+             "",
+             "  Scores are ordinary AutoDock4 binding free energies of the",
+             "  covalent adduct and ARE comparable between ligands. AutoDock4",
+             "  pins the flexible residue's root atom, so the covalent bond",
+             "  cannot move during the search; 'anchor drift' is the check",
+             "  that it did not.",
+             "",
+             f"Molecules ({len(results)}):"]
+    for idx, smi, warhead, met, sdf, status, detail in results:
+        lines.append(f"  [{idx}] {smi}")
+        if status != "ok":
+            lines.append(f"        {status}: {detail}")
+            continue
+        lines.append(f"        binding energy: {met['energy']:+.2f} kcal/mol"
+                     + (f"   (Ki {met['ki']})" if met["ki"] else ""))
+        lines.append(f"        ({detail})")
+        if met["drift"] is None:
+            lines.append("        anchor drift: not measurable")
+        elif met["drift"] <= COVALENT_ANCHOR_DRIFT_WARN:
+            lines.append(f"        anchor drift: {met['drift']:.3f} A "
+                         f"-- covalent attachment intact")
+        else:
+            lines.append(f"        anchor drift: {met['drift']:.3f} A "
+                         f"-- UNEXPECTED, the attachment should be pinned")
+        lines.append(f"        best pose SDF: {sdf}" if sdf else
+                     "        pose SDF: export failed (energies above are "
+                     "still valid)")
+    lines.append("")
+    ok = [r for r in results if r[5] == "ok"]
+    if ok:
+        b = min(ok, key=lambda r: r[3]["energy"])
+        lines.append(f"Best molecule: [{b[0]}] {b[1]}  warhead={b[2]}  "
+                     f"{b[3]['energy']:+.2f} kcal/mol"
+                     + (f"  Ki {b[3]['ki']}" if b[3]["ki"] else "")
+                     + (f"  SDF={b[4]}" if b[4] else ""))
+    else:
+        lines.append("Best molecule: none docked successfully")
+    return "\n".join(lines)
+
+
+def dock_covalent_agent(receptor_pdb: str, smiles_list: list[str],
+                        chain: str, resseq: int) -> str:
+    """
+    COVALENTLY dock ligands onto a cysteine or serine side chain in a
+    receptor. Use this instead of dock_at_centroid_agent when the ligands are
+    covalent inhibitors -- that is, when they carry an electrophilic warhead
+    (acrylamide or other Michael acceptor, chloroacetamide or other
+    haloacetamide, vinyl sulfone, epoxide, nitrile, aldehyde) meant to form a
+    permanent bond to the protein. Pass the FREE drug SMILES; the warhead is
+    reacted onto the side chain automatically, and the covalent bond geometry
+    is built exactly. Call detect_nucleophiles_agent first to get the chain
+    and residue number of the target cysteine/serine.
+
+    This runs the standard AutoDock covalent docking protocol: the adduct is
+    docked as a flexible residue by AutoDock4, which pins the attachment point
+    so the covalent bond cannot move while the rest of the ligand is searched.
+    The reported scores are ordinary AutoDock4 binding free energies (with a
+    Ki) and so CAN be compared between ligands to rank a series. They are not
+    comparable to blind_dock_agent or dock_at_centroid_agent affinities, which
+    come from a different scoring function. Each pose also reports an "anchor
+    drift" that should be about 0.00 A, confirming the attachment held.
+
+    It takes a few minutes per ligand, since it builds fresh AutoGrid maps and
+    runs a full genetic-algorithm search for each one.
+
+    Args:
+        receptor_pdb: path to a receptor PDB file.
+        smiles_list: iterable list of ligand SMILES strings (free drug form).
+        chain: chain identifier of the target residue, from
+            detect_nucleophiles_agent (e.g. "A").
+        resseq: residue number of the target cysteine/serine, from
+            detect_nucleophiles_agent (e.g. 12).
+    Returns:
+        A multi-line report (target residue, warhead found per ligand, the
+        AutoDock4 binding energy and Ki, the anchor-drift check and the
+        pose-SDF path).
+    """
+    # An agent-facing tool returns its failure as TEXT rather than raising:
+    # dock_assist.chat_turn calls these directly with no try/except, so a
+    # raised DockError ends the whole chat session instead of letting the model
+    # react (e.g. pick a different residue). Setup failures here are common
+    # enough -- missing autodock4, an unsupported residue, a ligand with no
+    # recognised warhead -- that this matters.
+    try:
+        return dock_covalent(receptor_pdb, smiles_list, chain=chain,
+                             resseq=resseq)
+    except DockError as e:
+        return f"covalent docking could not run: {e}"
+
+
+def _flat_graph(mol):
+    """A copy of `mol` reduced to its element/connectivity graph.
+
+    All bonds become single, aromaticity, charges, radicals and hydrogen counts
+    are cleared. Matching two molecules in this form compares only "which
+    elements are bonded to which", which is the one thing a PDBQT round-trip
+    preserves (see check_warhead_geometry).
+    """
+    from rdkit import Chem
+
+    q = Chem.RWMol(mol)
+    for b in q.GetBonds():
+        b.SetBondType(Chem.BondType.SINGLE)
+        b.SetIsAromatic(False)
+    for a in q.GetAtoms():
+        a.SetIsAromatic(False)
+        a.SetNoImplicit(True)
+        a.SetNumExplicitHs(0)
+        a.SetNumRadicalElectrons(0)
+        a.SetFormalCharge(0)
+    return q.GetMol()
+
+
+def check_warhead_geometry(receptor_pdb, pose_sdf, smiles,
+                           radius=NUCLEOPHILE_SEARCH_RADIUS):
+    """Is a docked (non-covalent) pose poised to react with a nearby nucleophile?
+
+    Locates the ligand's electrophilic warhead atom (the atom a covalent bond
+    would form at, per COVALENT_WARHEADS / WARHEAD_REACTING_ATOM) in a docked
+    pose and measures the distance from it to every nucleophilic side-chain
+    atom within `radius`. This is the covalent counterpart of the metal path's
+    coordination check: it says whether an ORDINARY docked pose happens to
+    place the warhead within striking distance, with no covalent docking.
+
+    The warhead is perceived in `smiles`, NOT in the pose file, and then mapped
+    onto the pose. [measured] A pose SDF converted back from PDBQT has lost
+    both its bond orders and its nonpolar hydrogens -- RDKit reads its carbons
+    as bracketed "[C]" with zero implicit H -- so a Michael acceptor, which is
+    defined by its C=C, cannot be perceived there at all, and even restoring
+    bond orders with AssignBondOrdersFromTemplate leaves the hydrogen counts
+    wrong so that every "[CX3]" query still fails. The element/connectivity
+    graph does survive, so `smiles` supplies the chemistry and _flat_graph
+    supplies the atom correspondence.
+
+    Returns (warhead name, warhead xyz, [(nucleophile dict, distance), ...])
+    sorted by distance, or (None, None, []) when the ligand has no recognised
+    warhead.
+    """
+    from rdkit import Chem
+
+    if not os.path.exists(pose_sdf):
+        raise DockError(f"pose SDF not found: {pose_sdf}")
+    ref = Chem.MolFromSmiles(smiles)
+    if ref is None:
+        raise DockError(f"RDKit could not parse SMILES: {smiles}")
+    pose = next(iter(Chem.SDMolSupplier(pose_sdf, removeHs=True)), None)
+    if pose is None:
+        raise DockError(f"RDKit could not read a molecule from {pose_sdf}")
+
+    for wname, detect, _ in COVALENT_WARHEADS:
+        patt = Chem.MolFromSmarts(detect)
+        if patt is None:
+            continue
+        hits = ref.GetSubstructMatches(patt)
+        if not hits:
+            continue
+        ref_idx = hits[0][WARHEAD_REACTING_ATOM[wname]]
+        match = _flat_graph(pose).GetSubstructMatch(_flat_graph(ref))
+        if not match or ref_idx >= len(match):
+            raise DockError(
+                f"{os.path.basename(pose_sdf)} does not match the SMILES "
+                f"given ({ref.GetNumAtoms()} heavy atoms vs "
+                f"{pose.GetNumAtoms()} in the pose): pass the same SMILES "
+                f"that was docked")
+        p = pose.GetConformer().GetAtomPosition(match[ref_idx])
+        wxyz = [p.x, p.y, p.z]
+        near = [(n, n["dist"]) for n in
+                detect_nucleophiles(receptor_pdb, center=wxyz, radius=radius)]
+        near.sort(key=lambda t: t[1])
+        return wname, wxyz, near
+    return None, None, []
+
+
+def check_warhead_geometry_agent(receptor_pdb: str, pose_sdf: str,
+                                 smiles: str) -> str:
+    """
+    Check whether an already-docked pose places its covalent warhead close
+    enough to a nucleophilic side chain to react. Call this AFTER
+    blind_dock_agent or dock_at_centroid_agent on a covalent inhibitor, using
+    the pose SDF path from that docking report: it reports which warhead the
+    ligand carries and the distance from it to each nearby cysteine, serine,
+    threonine, lysine, tyrosine or histidine. A distance under about 4 A means
+    the pose is poised to react and covalent docking with dock_covalent_agent
+    is worth running on that residue. This does NOT itself form a covalent
+    bond.
+
+    Args:
+        receptor_pdb: path to the receptor PDB file used for the docking.
+        pose_sdf: path to a docked pose SDF, as reported by a docking tool.
+        smiles: the SMILES of the ligand that was docked (the same string
+            passed to the docking tool). Required: a pose SDF alone does not
+            carry reliable bond orders, so the warhead is identified from the
+            SMILES and then located in the pose.
+    Returns:
+        A report naming the warhead and listing nearby nucleophilic residues
+        with distances, closest first.
+    """
+    try:  # return failures as text, not exceptions -- see dock_covalent_agent
+        wname, wxyz, near = check_warhead_geometry(receptor_pdb, pose_sdf,
+                                                   smiles)
+    except DockError as e:
+        return f"could not check warhead geometry: {e}"
+    if wname is None:
+        return (f"no recognised covalent warhead in {os.path.abspath(pose_sdf)} "
+                f"(recognised: "
+                f"{', '.join(w[0] for w in COVALENT_WARHEADS)})")
+    lines = [f"Warhead geometry for {os.path.abspath(pose_sdf)}:",
+             f"  warhead: {wname}, reacting atom at "
+             f"({wxyz[0]:.3f}, {wxyz[1]:.3f}, {wxyz[2]:.3f})"]
+    if not near:
+        lines.append(f"  no nucleophilic side chain within "
+                     f"{NUCLEOPHILE_SEARCH_RADIUS:.0f} A -- this pose is not "
+                     f"poised for covalent attack")
+        return "\n".join(lines)
+    lines.append("  nearby nucleophiles (closest first):")
+    for n, d in near:
+        flag = ""
+        if d <= 4.0:
+            flag = "   <-- POISED TO REACT"
+        elif d <= 6.0:
+            flag = "   (near)"
+        lines.append(f"    {n['resname']} {n['chain']}{n['resseq']} "
+                     f"{n['atom']} ({n['label']}): {d:.2f} A"
+                     f"{'' if n['dockable'] else ' [not dockable]'}{flag}")
+    best = near[0]
+    lines.append("")
+    if best[1] <= 4.0 and best[0]["dockable"]:
+        lines.append(f"Poised: run dock_covalent_agent with chain="
+                     f"'{best[0]['chain']}', resseq={best[0]['resseq']} to "
+                     f"dock this ligand covalently onto "
+                     f"{best[0]['resname']} {best[0]['chain']}{best[0]['resseq']}.")
+    elif best[1] <= 4.0:
+        lines.append(f"Closest nucleophile {best[0]['resname']} "
+                     f"{best[0]['chain']}{best[0]['resseq']} is within reach "
+                     f"but is not a residue this engine can dock covalently "
+                     f"(Cys/Ser only).")
+    else:
+        lines.append(f"Closest nucleophile is {best[1]:.2f} A away: this pose "
+                     f"is not poised for covalent attack.")
+    return "\n".join(lines)
+
+
 # --- main ------------------------------------------------------------------
 
 def main():

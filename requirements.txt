@@ -11,6 +11,12 @@ dockstring
 rich
 # metal-site docking (dock_metal_site_agent): meeko preps receptor/ligand PDBQTs
 # for the AD4Zn path; gemmi + prody are meeko's receptor-prep dependencies.
+# Covalent docking (dock_covalent_agent) needs the same three, and prody is
+# REQUIRED there specifically: meeko's covalent tether path
+# (mk_prepare_ligand.py --receptor/--rec_residue/--tether_smarts) imports prody
+# and refuses to run without it. Don't drop prody as "metal only".
+# Covalent docking additionally needs the AutoDock4 binary -- not a pip
+# package; see README "Installation".
 meeko
 gemmi
 prody

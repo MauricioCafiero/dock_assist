@@ -9,7 +9,9 @@ from rich.console import Console
 from rich.markdown import Markdown
 
 from modrag_protein_functions import get_protein_from_pdb, find_PDBID_node, smiles_node, check_nearby_molecules, find_ligand_centroids
-from vina_dock import blind_dock_agent, dock_at_centroid_agent, dock_metal_site_agent, detect_metal_sites_agent
+from vina_dock import (blind_dock_agent, dock_at_centroid_agent, dock_metal_site_agent,
+                       detect_metal_sites_agent, detect_nucleophiles_agent,
+                       dock_covalent_agent, check_warhead_geometry_agent)
 console = Console(width=80)
 import modrag_protein_functions
 import vina_dock
@@ -42,7 +44,9 @@ vina_dock.FALLBACK_TO_SECOND_POCKET = use_second_pocket_fallback
 
 tools = [find_PDBID_node, get_protein_from_pdb, smiles_node, check_nearby_molecules,
          find_ligand_centroids, blind_dock_agent, dock_at_centroid_agent,
-         detect_metal_sites_agent, dock_metal_site_agent]
+         detect_metal_sites_agent, dock_metal_site_agent,
+         detect_nucleophiles_agent, dock_covalent_agent,
+         check_warhead_geometry_agent]
 
 #get ket from shell variable $OLLAMA_API_KEY
 ollama_key = os.getenv('OLLAMA_API_KEY')
@@ -94,6 +98,31 @@ carry donor site terms that place coordination wells at crystal-chemical
 metal-donor contact distances so poses can coordinate the ion), and
 for every non-zinc engine each pose is checked for actual metal coordination.
 
+Covalent inhibitors: if a ligand carries an electrophilic warhead (an
+acrylamide or other Michael acceptor, a chloroacetamide or other
+haloacetamide, a vinyl sulfone, an epoxide, a nitrile or an aldehyde) it may
+bind covalently to a cysteine or serine. Call detect_nucleophiles_agent with
+the binding-site centre (e.g. a co-crystallized ligand centroid from
+find_ligand_centroids) to list the nearby nucleophilic side chains. Then, when
+the ligand has been docked normally, call check_warhead_geometry_agent with
+the receptor, that pose SDF and the ligand SMILES to see whether the warhead
+landed within striking distance of a nucleophile (under about 4 A). Those two
+tools are reliable, and together they are the recommended way to assess a
+covalent inhibitor: dock_at_centroid_agent for the binding mode and score,
+check_warhead_geometry_agent for whether the warhead is poised to react.
+
+For an actual covalent docking, call dock_covalent_agent with the chain and
+residue number of the chosen cysteine/serine. Pass the FREE drug SMILES -- the
+warhead is reacted onto the side chain for you, and the adduct is then docked
+as a flexible residue by AutoDock4, which pins the attachment point so the
+covalent bond cannot move while the rest of the ligand is searched. Its scores
+are ordinary AutoDock4 binding free energies with a Ki, so they CAN be
+compared between ligands to rank a series; they must NOT be compared with
+blind_dock_agent or dock_at_centroid_agent affinities, which come from a
+different scoring function. Each pose also reports an "anchor drift" that
+should be about 0.00 A, confirming the covalent attachment held. It takes a
+few minutes per ligand, so prefer a short SMILES list.
+
 After docking, if the PDB structure has a ligand bound, you should also check for nearby molecules in the
 PDB file (using the tool) to assess if the docking has located the correct binding site.
 '''
@@ -129,7 +158,10 @@ def chat_turn(prompt: str):
     'find_ligand_centroids': find_ligand_centroids,
     'check_nearby_molecules': check_nearby_molecules,
     'detect_metal_sites_agent': detect_metal_sites_agent,
-    'dock_metal_site_agent': dock_metal_site_agent
+    'dock_metal_site_agent': dock_metal_site_agent,
+    'detect_nucleophiles_agent': detect_nucleophiles_agent,
+    'dock_covalent_agent': dock_covalent_agent,
+    'check_warhead_geometry_agent': check_warhead_geometry_agent
   }
 
   messages.append({'role': 'user', 'content': prompt})
@@ -140,7 +172,9 @@ def chat_turn(prompt: str):
           messages=messages,
           tools=[find_PDBID_node, get_protein_from_pdb, smiles_node, check_nearby_molecules,
                  find_ligand_centroids, blind_dock_agent, dock_at_centroid_agent,
-                 detect_metal_sites_agent, dock_metal_site_agent],
+                 detect_metal_sites_agent, dock_metal_site_agent,
+                 detect_nucleophiles_agent, dock_covalent_agent,
+                 check_warhead_geometry_agent],
           think=True,
       )
       messages.append(response.message)

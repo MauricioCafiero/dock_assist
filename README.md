@@ -46,6 +46,25 @@ where it is), and dock the requested ligands with AutoDock Vina.
   engines, and the rest keep the metal in the receptor — every
   pose carries a coordination check. See
   [Metal-site docking](#metal-site-docking-ad4zn).
+- **Covalent-inhibitor geometry tools.** `detect_nucleophiles_agent` lists the
+  nucleophilic side chains near a binding site (Cys, Ser, Thr, Lys, Tyr, His)
+  with coordinates and distances, and `check_warhead_geometry_agent` takes an
+  ordinary docked pose and reports whether the ligand's electrophilic warhead
+  (acrylamide or other Michael acceptor, haloacetamide, vinyl sulfone,
+  epoxide, nitrile, aldehyde) landed within striking distance of one — the
+  covalent counterpart of the metal path's coordination check.
+- **Covalent docking (AutoDock4 flexible side chain).**
+  `dock_covalent_agent` docks covalent inhibitors onto a chosen **cysteine or
+  serine** from the **free drug SMILES**: the warhead is reacted onto the side
+  chain for you and the adduct is docked as a *flexible residue* by AutoDock4,
+  which pins the attachment point so the covalent bond cannot move while the
+  rest of the ligand gets a full genetic-algorithm search. This is the
+  standard published protocol, not an approximation. Scores are ordinary
+  AutoDock4 binding free energies (with a Ki), so they **can** be compared
+  between ligands. Redocking four known covalent drugs from their SMILES
+  places every one within **0.7 Å** centroid error of the crystal adduct, two
+  of them at sub-1.3 Å RMSD. See
+  [Covalent docking](#covalent-docking-autodock4).
 
 ---
 
@@ -111,6 +130,16 @@ You also need:
   AD4Zn scripts/parameter file in `ad4zn/` (already in the repo). Paths can be
   moved via the `ADFR_PYTHONSH`, `AUTOGRID_BIN`, `VINA_12_BIN` and `AD4ZN_DIR`
   environment variables. See [Metal-site docking](#metal-site-docking-ad4zn).
+- **Covalent docking (optional, for `dock_covalent_agent`).** Adds
+  **AutoDock4**, which does the covalent search, plus the ADFR suite's
+  `autogrid4` already installed for metal docking. bioconda ships AutoDock4
+  for osx-64, so it runs under Rosetta like the `adfr-suite` env; give it its
+  own env rather than adding it to `adfr-suite`, whose `autogrid4` is patched
+  for AD4Zn:
+  `CONDA_SUBDIR=osx-64 conda create -n autodock4 -c bioconda autodock`.
+  Override with `AUTODOCK4_BIN`. `detect_nucleophiles_agent` and
+  `check_warhead_geometry_agent` need nothing beyond `requirements.txt`. See
+  [Covalent docking](#covalent-docking-autodock4).
 
 ---
 
@@ -395,6 +424,103 @@ and can be moved with the `ADFR_PYTHONSH`, `AUTOGRID_BIN`, `VINA_12_BIN` and
 
 ---
 
+## Covalent docking (AutoDock4)
+
+Covalent inhibitors bind by forming a permanent bond from an electrophilic
+**warhead** to a nucleophilic side chain — most often a cysteine. Ordinary
+docking cannot represent that bond, so these three tools handle it.
+
+### Finding the attachment point
+
+**`detect_nucleophiles_agent`** lists the nucleophilic side chains near a
+binding site: cysteine SG, serine OG, threonine OG1, lysine NZ, tyrosine OH
+and histidine NE2, each with its chain, residue number, coordinates and
+distance from the site centre. Pass a site centre you already know — typically
+a co-crystallized ligand centroid from `find_ligand_centroids`. Residues
+marked **dockable** are the ones covalent docking supports (Cys and Ser).
+
+### Checking whether a normal pose is poised to react
+
+**`check_warhead_geometry_agent`** is the cheap first question: dock the ligand
+normally, then ask whether its warhead happened to land close to a
+nucleophile. Given a receptor, a pose SDF and the ligand SMILES it names the
+warhead and lists nearby nucleophiles with distances; under about 4 Å means the
+pose is poised to react. This is the covalent counterpart of the metal path's
+coordination check, and it forms no bond itself.
+
+### Docking the covalent adduct
+
+**`dock_covalent_agent`** performs a real covalent docking onto a chosen
+cysteine or serine. Pass the **free drug SMILES** — the warhead is reacted onto
+the side chain for you:
+
+| Warhead | Recognised as |
+|---|---|
+| acrylamide, crotonamide, fumarate, acrylate | Michael acceptor (S adds to the β carbon) |
+| chloro/bromo/iodoacetamide | haloacetamide (SN2, halide leaves) |
+| vinyl sulfone | Michael acceptor |
+| epoxide | ring opening |
+| nitrile | thioimidate (reversible in reality — see caveats) |
+| aldehyde | hemithioacetal (reversible in reality) |
+
+The adduct is then docked using the standard **AutoDock "flexible side chain"
+covalent protocol**: the adduct is superimposed on the target residue and
+docked *as a flexible residue*, and AutoDock4 pins a flexible residue's root
+atom, so **the covalent bond cannot move during the search** while the rest of
+the ligand gets a full genetic-algorithm search of its torsions. Each pose
+reports an **anchor drift** confirming the attachment held (expect ~0.00 Å).
+
+Scores are ordinary AutoDock4 binding free energies with a Ki, so they **can**
+be compared between ligands to rank a series. They are **not** comparable to
+`blind_dock_agent` / `dock_at_centroid_agent` affinities, which come from
+Vina's scoring function.
+
+Validated by redocking four classic covalent complexes from the free drug
+SMILES, each with a crystallographic `LINK` record as ground truth and all
+HETATMs stripped from the receptor, so the crystal ligand cannot bias the
+result. Metrics are in the crystal's own frame with no superposition:
+
+| PDB | target + drug | centroid | overlap | RMSD | energy (Ki) | anchor drift |
+|---|---|---|---|---|---|---|
+| 6OIM | KRAS G12C + sotorasib | 0.35 Å | 95 % | 2.21 Å | −9.32 (146 nM) | 0.007 Å |
+| 7RFS | Mpro + nirmatrelvir | 0.39 Å | 97 % | 1.25 Å | −12.76 (444 pM) | 0.002 Å |
+| 4G5J | EGFR + afatinib | 0.32 Å | 76 % | 7.33 Å | −8.35 (753 nM) | 0.008 Å |
+| 5P9J | BTK + ibrutinib | 0.70 Å | 94 % | 1.19 Å | −9.93 (52.8 nM) | 0.013 Å |
+
+Against the usual ≤2 Å "correct pose" bar, **7RFS and 5P9J are solved**, 6OIM
+is marginal at 2.21 Å with the placement clearly right, and **4G5J is only
+partially right**: the ligand sits in the right volume (0.32 Å centroid) but a
+substituent is evidently mis-oriented, which is what the high RMSD against a
+low centroid error means. Anchor drift stays at 0.002–0.013 Å throughout — the
+covalent attachment always holds. Run the suite with
+`python3 code/test_covalent.py`.
+
+**Caveats, in plain terms:**
+
+- **Cys and Ser only.** Thr/Lys/Tyr/His are detected and reported but cannot
+  yet be docked.
+- **No bond energetics.** Warhead reactivity, the reaction barrier and
+  reversibility are not modelled, so two ligands with the same pose and
+  different warheads score the same. Nitriles and aldehydes are reversible in
+  reality but are treated like irreversible warheads.
+- **Rigid receptor** apart from the removed target side chain, so an inhibitor
+  needing induced fit will score badly.
+- **A few minutes per ligand** — each one gets fresh AutoGrid maps and a full
+  search, so keep the SMILES list short.
+
+Requires AutoDock4, which bioconda ships for osx-64 (it runs under Rosetta,
+like the `adfr-suite` env used by metal docking):
+
+```sh
+CONDA_SUBDIR=osx-64 conda create -n autodock4 -c bioconda autodock
+```
+
+Override its location with `AUTODOCK4_BIN`; AutoGrid comes from
+`AUTOGRID_BIN`. Implementation notes, measured gotchas and the full validation
+record: **[`COVALENT_DOCKING.md`](COVALENT_DOCKING.md)**.
+
+---
+
 ## Proximity fallback to second pocket (opt-in)
 
 Blind docking ranks pockets by a geometry score and, by default, keeps only the
@@ -555,6 +681,13 @@ Best molecule: [0] C1=CC(=CC=C1CCN)O  score=-6.80 kcal/mol  SDF=pdb_files/SULT1A
 - `pdb_files/<stem>_c<i>.sdf` — the docked poses (top 3) for ligand *i* from a
   centroid dock (`c` = centroid, to avoid clobbering the blind-dock SDF above).
   Also deleted at the start of the next run.
+- `pdb_files/<stem>_cov<i>.sdf` — the best covalent pose for ligand *i*
+  (`cov` = covalent docking). The adduct keeps the three side-chain mimic
+  atoms, so the attachment is visible when you load it beside the receptor.
+  Also deleted at the start of the next run.
+- `<stem>_cov<chain><resseq>_rigid.pdbqt` — the rigid receptor for covalent
+  docking at that residue, with the target side chain removed; built once and
+  reused across ligands.
 - `<stem>.pdbqt` — the rigid receptor PDBQT built once and reused across calls.
 - Per-run intermediates (ligand PDBQT, per-pocket poses/logs) go to a temp
   directory that is cleaned up at the end.
