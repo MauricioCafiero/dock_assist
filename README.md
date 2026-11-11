@@ -101,6 +101,18 @@ The agent exposes nine tools to the LLM:
 
 ## Installation
 
+The agent itself needs only a virtualenv. The optional metal-site and covalent
+docking engines additionally need **conda** and, on Apple Silicon, **Rosetta
+2**, because the AutoDock tooling is distributed for `osx-64` only:
+
+```bash
+# prerequisites for the optional docking engines (skip if you only want
+# blind / centroid docking, which run on the vendored Vina):
+softwareupdate --install-rosetta --agree-to-license   # Apple Silicon only
+#   and a conda: Miniforge is what this repo was built against ->
+#   https://github.com/conda-forge/miniforge
+```
+
 ```bash
 python3 -m venv dock-env
 source dock-env/bin/activate
@@ -742,7 +754,39 @@ pose in the receptor's binding site.
 
 ## Requirements
 
-`ollama`, `rdkit`, `scipy`, `scikit-learn`, `pubchempy`, `pandas`, `requests`,
-`rcsb-api`, `dockstring`, `openbabel-wheel`, `rich` — see `requirements.txt`.
-The `obabel` CLI comes from `openbabel-wheel` and is placed on your PATH
-automatically; no extra install step.
+**Python packages** (`pip install -r requirements.txt`): `ollama`, `rdkit`,
+`scipy`, `scikit-learn`, `pubchempy`, `pandas`, `requests`, `rcsb-api`,
+`dockstring`, `openbabel-wheel`, `rich`, plus `meeko`, `gemmi` and `prody` for
+the metal and covalent paths. The `obabel` CLI comes from `openbabel-wheel`
+and lands on your PATH automatically; no extra install step.
+
+**External binaries.** Only the first is required; the rest gate specific
+features, and the agent reports a clear error naming the missing one rather
+than failing obscurely.
+
+| Tool | Needed for | Source | Override |
+|---|---|---|---|
+| Vina 1.1.2 | `blind_dock_agent`, `dock_at_centroid_agent` | vendored inside `dockstring` — nothing to install | `--vina-bin` |
+| Vina ≥ 1.2 | metal-site docking (`--scoring ad4`, `--maps`) | `conda create -n vina -c conda-forge vina` | `VINA_12_BIN` |
+| `autogrid4` + `pythonsh` | metal-site **and** covalent docking | `CONDA_SUBDIR=osx-64 conda create -n adfr-suite -c hcc adfr-suite` — **then patch `autogrid4`, see [`METAL_DOCKING.md`](METAL_DOCKING.md) §2.3** | `AUTOGRID_BIN`, `ADFR_PYTHONSH` |
+| `autodock4` | covalent docking (runs the search) | `CONDA_SUBDIR=osx-64 conda create -n autodock4 -c bioconda autodock` | `AUTODOCK4_BIN` |
+| AD4Zn assets | zinc docking | `ad4zn/` — already in the repo | `AD4ZN_DIR` |
+
+Notes on the AutoDock pieces, both `osx-64` and so both under Rosetta on
+Apple Silicon:
+
+- **`autogrid4` does not run as shipped.** It is linked against a
+  `libgomp.1.dylib` at a hard-coded build-machine path and dies with a `dyld:
+  Library not loaded` error. The repair is env-local `install_name_tool`
+  surgery — [`METAL_DOCKING.md`](METAL_DOCKING.md) §2.3. Do it before trying
+  either engine.
+- **`autodock4` is given its own env on purpose**, rather than being added to
+  `adfr-suite`, so that a conda solve cannot disturb the patched `autogrid4`
+  sitting there. It needs no patching itself: it links only `libSystem` and
+  `libc++`.
+- The env also ships `autodock4.omp`, an OpenMP build. It is **not** used,
+  because it links `libomp` and would need that discoverable; the plain
+  `autodock4` is single-threaded and the GA search is the cost anyway.
+
+No system installers are used anywhere — everything lives in a virtualenv or a
+conda env you own.
