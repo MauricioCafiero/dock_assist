@@ -1,6 +1,6 @@
 openbabel-wheel
 ollama
-rdkit
+rdkit>=2024.3
 scipy
 scikit-learn
 pubchempy
@@ -17,6 +17,11 @@ rich
 # and refuses to run without it. Don't drop prody as "metal only".
 # Covalent docking additionally needs the AutoDock4 binary -- not a pip
 # package; see README "Installation".
-meeko
+# meeko is pinned on purpose. The covalent path drives its CLI directly --
+# mk_prepare_receptor.py -f/-p/--allow_bad_res/--default_altloc and
+# mk_prepare_ligand.py --receptor/--rec_residue/--tether_smarts -- and those
+# flags have moved between meeko releases. An unpinned meeko can break
+# covalent docking with confusing errors. Tested with 0.8.0.
+meeko>=0.8,<1.0
 gemmi
 prody

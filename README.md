@@ -143,13 +143,11 @@ You also need:
   moved via the `ADFR_PYTHONSH`, `AUTOGRID_BIN`, `VINA_12_BIN` and `AD4ZN_DIR`
   environment variables. See [Metal-site docking](#metal-site-docking-ad4zn).
 
-  > **`autogrid4` from that package will not run until it is patched.** It is
-  > linked against a `libgomp.1.dylib` at a hard-coded path from the build
-  > machine and dies with `dyld: Library not loaded: .../libgomp.1.dylib`.
-  > Only `autogrid4` is affected. The fix is a four-step, env-local
-  > `install_name_tool` repair with no system changes — see
-  > **[`METAL_DOCKING.md`](METAL_DOCKING.md) §2.3**. Both metal-site *and*
-  > covalent docking need a working `autogrid4`, so do this before either.
+  > **`autogrid4` from that package needs a one-off repair before it will
+  > run**, and both metal-site *and* covalent docking depend on it. The fix
+  > stays inside the conda env and changes nothing system-wide — follow
+  > **[`METAL_DOCKING.md`](METAL_DOCKING.md) §2.3** before trying either
+  > engine.
 - **Covalent docking (optional, for `dock_covalent_agent`).** Needs **two**
   things: the ADFR suite's **`autogrid4`** (same component as metal docking,
   including the libgomp patch noted above — install it even if you do not want
@@ -557,9 +555,9 @@ These are single GA runs and vary somewhat between repeats. Run the suite with
   ligands are retained in the receptor; **waters are dropped**, and so is
   whatever ligand is already bound at the target residue — that last one is
   mandatory, since in a covalent complex it sits in the pocket you are docking
-  into. It is identified from the structure's `LINK` record, falling back to a
-  2.5 Å bond-length test against the nucleophile. So a structural water in the
-  site is not represented, but a cofactor that shapes the site is.
+  into; it is recognised from the structure's own `LINK` record. So a
+  structural water in the site is not represented, but a cofactor that shapes
+  the site is.
 - **A few minutes per ligand** — each one gets fresh AutoGrid maps and a full
   search, so keep the SMILES list short.
 
@@ -754,6 +752,8 @@ pose in the receptor's binding site.
 
 ## Requirements
 
+**Python 3.11+**; developed and tested on 3.14.5.
+
 **Python packages** (`pip install -r requirements.txt`): `ollama`, `rdkit`,
 `scipy`, `scikit-learn`, `pubchempy`, `pandas`, `requests`, `rcsb-api`,
 `dockstring`, `openbabel-wheel`, `rich`, plus `meeko`, `gemmi` and `prody` for
@@ -772,21 +772,31 @@ than failing obscurely.
 | `autodock4` | covalent docking (runs the search) | `CONDA_SUBDIR=osx-64 conda create -n autodock4 -c bioconda autodock` | `AUTODOCK4_BIN` |
 | AD4Zn assets | zinc docking | `ad4zn/` — already in the repo | `AD4ZN_DIR` |
 
-Notes on the AutoDock pieces, both `osx-64` and so both under Rosetta on
-Apple Silicon:
+Both AutoDock components are `osx-64` builds, so on Apple Silicon they run
+under Rosetta (see [Installation](#installation)). Two practical points:
 
-- **`autogrid4` does not run as shipped.** It is linked against a
-  `libgomp.1.dylib` at a hard-coded build-machine path and dies with a `dyld:
-  Library not loaded` error. The repair is env-local `install_name_tool`
-  surgery — [`METAL_DOCKING.md`](METAL_DOCKING.md) §2.3. Do it before trying
-  either engine.
-- **`autodock4` is given its own env on purpose**, rather than being added to
-  `adfr-suite`, so that a conda solve cannot disturb the patched `autogrid4`
-  sitting there. It needs no patching itself: it links only `libSystem` and
-  `libc++`.
-- The env also ships `autodock4.omp`, an OpenMP build. It is **not** used,
-  because it links `libomp` and would need that discoverable; the plain
-  `autodock4` is single-threaded and the GA search is the cost anyway.
+- **`autogrid4` needs the one-off repair** in
+  [`METAL_DOCKING.md`](METAL_DOCKING.md) §2.3 before it will run. `autodock4`
+  needs nothing of the sort.
+- **Give `autodock4` its own conda env**, as above, rather than adding it to
+  `adfr-suite` — that keeps a later conda solve from disturbing the repaired
+  `autogrid4`. Why that matters is in
+  [`COVALENT_DOCKING.md`](COVALENT_DOCKING.md).
 
 No system installers are used anywhere — everything lives in a virtualenv or a
 conda env you own.
+
+**Tested against** (the versions this was developed on, if you need to
+reproduce an environment exactly): Python 3.14.5, rdkit 2026.03.3,
+meeko 0.8.0, prody 2.6.1, gemmi 0.7.5, scipy 1.18.0, numpy 2.5.1,
+AutoDock Vina 1.2.7, AutoDock4 4.2.6, autogrid4 4.2.7.x.
+
+---
+
+## License
+
+MIT — see [`LICENSE`](LICENSE). If you use this in published work, please also
+cite the methods it builds on: AutoDock Vina 1.2 (Eberhardt et al., *JCIM*
+2021), AutoDock4Zn (Santos-Martins et al., *JCIM* 2014) for metal-site
+docking, and the covalent docking protocol (Bianco, Forli, Goodsell & Olson,
+*Protein Sci* 2015). See [`CITATION.cff`](CITATION.cff).

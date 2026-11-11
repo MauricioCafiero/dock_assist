@@ -1,0 +1,119 @@
+cff-version: 1.2.0
+title: "Modrag-dock: a conversational agent for protein-ligand docking"
+message: >-
+  If you use this software, please cite it along with the docking methods it
+  builds on (listed under references).
+type: software
+authors:
+  - family-names: Cafiero
+    given-names: Mauricio
+repository-code: "https://github.com/MauricioCafiero/dock_assist"
+license: MIT
+abstract: >-
+  A command-line agent that drives protein-ligand docking from natural
+  language: it searches the PDB, retrieves receptors, resolves ligand SMILES,
+  and docks with AutoDock Vina. Binding sites can be found by a pure-Python
+  buriedness grid scan, taken from a co-crystallized ligand centroid, or
+  specified directly. Metal sites are docked with the AutoDock4Zn force field
+  for zinc and tiered AutoGrid parameter sets for eleven other metals.
+  Covalent inhibitors are docked with the AutoDock flexible-side-chain
+  covalent protocol, with the warhead reacted onto the target cysteine or
+  serine from the free drug SMILES.
+keywords:
+  - molecular docking
+  - drug discovery
+  - AutoDock Vina
+  - covalent docking
+  - metalloprotein
+  - large language model agent
+
+references:
+  - type: article
+    title: >-
+      AutoDock Vina 1.2.0: New Docking Methods, Expanded Force Field, and
+      Python Bindings
+    authors:
+      - family-names: Eberhardt
+        given-names: Jerome
+      - family-names: Santos-Martins
+        given-names: Diogo
+      - family-names: Tillack
+        given-names: Andreas F.
+      - family-names: Forli
+        given-names: Stefano
+    journal: Journal of Chemical Information and Modeling
+    year: 2021
+    volume: 61
+    issue: 8
+    start: 3891
+    end: 3898
+    doi: 10.1021/acs.jcim.1c00203
+
+  - type: article
+    title: >-
+      AutoDock4Zn: An Improved AutoDock Force Field for Small-Molecule Docking
+      to Zinc Metalloproteins
+    authors:
+      - family-names: Santos-Martins
+        given-names: Diogo
+      - family-names: Forli
+        given-names: Stefano
+      - family-names: Ramos
+        given-names: Maria João
+      - family-names: Olson
+        given-names: Arthur J.
+    journal: Journal of Chemical Information and Modeling
+    year: 2014
+    volume: 54
+    issue: 8
+    start: 2371
+    end: 2379
+    doi: 10.1021/ci500209e
+
+  - type: article
+    title: >-
+      Covalent docking using autodock: Two-point attractor and flexible side
+      chain methods
+    authors:
+      - family-names: Bianco
+        given-names: Giulia
+      - family-names: Forli
+        given-names: Stefano
+      - family-names: Goodsell
+        given-names: David S.
+      - family-names: Olson
+        given-names: Arthur J.
+    journal: Protein Science
+    year: 2016
+    volume: 25
+    issue: 1
+    start: 295
+    end: 301
+    doi: 10.1002/pro.2733
+
+  - type: article
+    title: >-
+      AutoDock4 and AutoDockTools4: Automated docking with selective receptor
+      flexibility
+    authors:
+      - family-names: Morris
+        given-names: Garrett M.
+      - family-names: Huey
+        given-names: Ruth
+      - family-names: Lindstrom
+        given-names: William
+      - family-names: Sanner
+        given-names: Michel F.
+      - family-names: Belew
+        given-names: Richard K.
+      - family-names: Goodsell
+        given-names: David S.
+      - family-names: Olson
+        given-names: Arthur J.
+    journal: Journal of Computational Chemistry
+    year: 2009
+    volume: 30
+    issue: 16
+    start: 2785
+    end: 2791
+    doi: 10.1002/jcc.21256

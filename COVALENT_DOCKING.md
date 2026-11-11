@@ -95,7 +95,23 @@ CONDA_SUBDIR=osx-64 conda create -n autodock4 -c bioconda autodock
 ```
 
 Overridable with `AUTODOCK4_BIN`; AutoGrid comes from the existing
-`AUTOGRID_BIN`. `agfr`/`adfr` from the ADFR suite were also considered (ADFR
+`AUTOGRID_BIN`.
+
+[measured] `autodock4` itself needs no patching, unlike `adfr-suite`'s
+`autogrid4`: `otool -L` shows it links only `/usr/lib/libSystem.B.dylib` and
+`@rpath/libc++.1.dylib`. The env also ships **`autodock4.omp`**, an OpenMP
+build, which is deliberately **not** used — it links `@rpath/libomp.dylib`,
+and libomp is keg-only on this machine, so it would reintroduce a library
+discovery problem for no benefit (the plain binary is single-threaded, and the
+GA search dominates the runtime anyway).
+
+[measured] Both binaries run with **no environment at all** — verified under
+`env -i` with only `HOME` and `PATH=/usr/bin:/bin`. No conda activation, no
+`DYLD_FALLBACK_LIBRARY_PATH`, no `~/.zshrc`. `autogrid4` resolves its patched
+libgomp through `@executable_path/../lib/`, which is what the §2.3 repair in
+METAL_DOCKING.md buys: the install name is relative to the binary rather than
+absolute. That matters because `dock_assist.py` invokes these as subprocesses
+from a venv, which inherits none of a login shell's exports. `agfr`/`adfr` from the ADFR suite were also considered (ADFR
 can do covalent docking) but **[measured] both segfault on this machine**
 (exit 139, no output); only `autogrid4` and `pythonsh` from that env work.
 
