@@ -3,7 +3,7 @@ import glob
 from PIL import Image
 from collections import Counter
 from typing import Annotated, TypedDict
-import time, sys, argparse
+import time, sys, argparse, traceback
 from ollama import Client as ollama_client
 from rich.console import Console
 from rich.markdown import Markdown
@@ -189,7 +189,26 @@ def chat_turn(prompt: str):
           if tc.function.name in available_functions:
             if print_flag:
               print(f"Calling {tc.function.name} with arguments {tc.function.arguments}")
-            result = available_functions[tc.function.name](**tc.function.arguments)
+            # Hand a failed tool call back to the model as TEXT instead of
+            # letting it end the session. This call used to be bare, so any
+            # exception propagated out of chat_turn and killed the whole CLI,
+            # losing the chat history mid-task. The common trigger is the model
+            # passing a path that does not exist -- the file-reading tools open
+            # it blind -- and the docking tools likewise raise DockError for
+            # setup failures. Returned as a message, the model can see what
+            # went wrong and retry (e.g. with the receptor path
+            # get_protein_from_pdb actually reported).
+            #
+            # Catching here rather than inside each tool is deliberate: a
+            # hallucinated keyword argument raises TypeError at the call site
+            # itself, before any tool body runs, so no try/except inside
+            # vina_dock.py or modrag_protein_functions.py can reach it.
+            try:
+              result = available_functions[tc.function.name](**tc.function.arguments)
+            except Exception as e:
+              result = f"TOOL ERROR ({type(e).__name__}): {e}"
+              if print_flag:
+                traceback.print_exc()
             if print_flag:
               print(f"Result: {result}")
               print('------------------------------------------------------------------------')
