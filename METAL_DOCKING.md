@@ -193,17 +193,28 @@ records are ligand-only and rejected as "Unknown or inappropriate tag".
 | vina-metal engine | same receptor with ZN→MG, full tool | docks (Vina 1.2.7 accepts `Mg` type), coordination honestly reported absent (5.91 Å) |
 | Error paths | center with no ion ≤ 3 Å | clean DockError pointing at `detect_metal_sites_agent` |
 
-Re-verification one-liner (receptor at `/tmp/ad4zntest/proteinH.pdb`):
+**What the committed test actually reproduces.** `code/test_metal.py` builds
+its receptor differently from the run that produced the table above: protein
+`ATOM` records plus the Zn ion straight from the PDB entry, protonated by
+meeko, where the original used the AD4Zn tutorial's `reduce`-prepared
+`proteinH.pdb`. It confirms the behaviour -- engine `ad4zn`, the pose
+coordinating the zinc, a sensible placement -- but lands at **-10.54 kcal/mol
+with the donor N at 2.25 A** (pose centroid 1.68 A from the crystal `778`,
+52 % heavy-atom overlap) rather than -12.08 / 1.91 A. The coordination
+distance is still inside the crystallographic Zn-N range of 2.0-2.2 A. Treat
+the -12.08 / 1.91 A figures as specific to the tutorial receptor, and the
+test's numbers as the ones reproducible from a clone.
 
-```python
-import sys; sys.path.insert(0, 'code')
-import vina_dock
-print(vina_dock.dock_metal_site('/tmp/ad4zntest/proteinH.pdb',
-    ['N#Cc1ccc(Cn2cncc2CN2CCN(c3cccc(Cl)c3)C(=O)C2)cc1'],
-    center=(18.142, 132.126, 5.224), exhaustiveness=16, seed=1))
-```
+Re-verification is now a committed test rather than a scratch path — run
+`python3 code/test_metal.py` from the repo root (`--fast` for the detection
+and error checks alone). It downloads 1S63, builds the receptor as protein +
+the Zn ion, redocks the inhibitor from the SMILES above and checks the engine
+chosen, the score, the donor-to-zinc distance and the pose against the crystal
+`778` ligand.
 
-Expect: engine `ad4zn`, best ≈ −12 kcal/mol, "COORDINATES ZN at 1.91 A".
+The earlier one-liner in this file pointed at `/tmp/ad4zntest/proteinH.pdb`,
+which no longer exists, so none of the numbers in the table above could be
+re-checked from a clone. That is what `code/test_metal.py` fixes.
 
 ---
 

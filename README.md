@@ -130,9 +130,19 @@ You also need:
   AD4Zn scripts/parameter file in `ad4zn/` (already in the repo). Paths can be
   moved via the `ADFR_PYTHONSH`, `AUTOGRID_BIN`, `VINA_12_BIN` and `AD4ZN_DIR`
   environment variables. See [Metal-site docking](#metal-site-docking-ad4zn).
-- **Covalent docking (optional, for `dock_covalent_agent`).** Adds
-  **AutoDock4**, which does the covalent search, plus the ADFR suite's
-  `autogrid4` already installed for metal docking. bioconda ships AutoDock4
+
+  > **`autogrid4` from that package will not run until it is patched.** It is
+  > linked against a `libgomp.1.dylib` at a hard-coded path from the build
+  > machine and dies with `dyld: Library not loaded: .../libgomp.1.dylib`.
+  > Only `autogrid4` is affected. The fix is a four-step, env-local
+  > `install_name_tool` repair with no system changes — see
+  > **[`METAL_DOCKING.md`](METAL_DOCKING.md) §2.3**. Both metal-site *and*
+  > covalent docking need a working `autogrid4`, so do this before either.
+- **Covalent docking (optional, for `dock_covalent_agent`).** Needs **two**
+  things: the ADFR suite's **`autogrid4`** (same component as metal docking,
+  including the libgomp patch noted above — install it even if you do not want
+  metal docking) and **AutoDock4**, which runs the covalent search. bioconda
+  ships AutoDock4
   for osx-64, so it runs under Rosetta like the `adfr-suite` env; give it its
   own env rather than adding it to `adfr-suite`, whose `autogrid4` is patched
   for AD4Zn:
@@ -140,6 +150,32 @@ You also need:
   Override with `AUTODOCK4_BIN`. `detect_nucleophiles_agent` and
   `check_warhead_geometry_agent` need nothing beyond `requirements.txt`. See
   [Covalent docking](#covalent-docking-autodock4).
+
+---
+
+## Tests
+
+Nothing here is wired to a test runner; each script is standalone and is run
+from the repo root with the virtualenv active.
+
+```bash
+source dock-env/bin/activate
+
+python3 code/unit_test.py              # smoke test: check_nearby_molecules
+python3 code/test_covalent.py          # covalent docking: 4 redocks vs crystal
+python3 code/test_metal.py --fast      # metal: detection + error paths, seconds
+python3 code/test_metal.py             # metal: + the full AD4Zn redock of 1S63
+```
+
+`test_covalent.py` and `test_metal.py` download the structures they need from
+RCSB into `pdb_files/` on first run, so they need network access but no
+manual setup. Both take a few minutes per docking case: each one builds fresh
+AutoGrid maps and runs a full search. `test_metal.py --fast` skips all docking
+and is the quick way to confirm an install works.
+
+Both compare the predicted pose with the crystal ligand **in the crystal's own
+frame with no superposition**, so any agreement reported is real rather than
+fitted.
 
 ---
 
