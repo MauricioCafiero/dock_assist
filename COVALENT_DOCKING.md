@@ -101,20 +101,44 @@ can do covalent docking) but **[measured] both segfault on this machine**
 
 ## Measured gotchas
 
-- **The receptor must be stripped of HETATM, and the engine does it itself.**
-  This is a correctness requirement, not tidying: a structure fetched for
-  redocking still holds the co-crystallized inhibitor, and in a covalent
-  complex that ligand occupies the very pocket being docked into. The official
-  tutorial README is blunt about it — *"if a covalent ligand is already bound
-  to the residue in the protein structure, it must be removed!"*. It also
-  happens to be what meeko needs: **[measured]** run on the raw 6OIM as
-  fetched by `get_protein_from_pdb`, `mk_prepare_receptor.py` aborts with
-  `Input residues {'A:302': 'GDP', 'A:303': 'MOV'} not in residue_templates`
-  — `MOV` being the bound sotorasib adduct itself. `_cov_rigid_receptor` now
-  writes a protein-only PDB (all `ATOM` records, all chains) before calling
-  meeko and deletes it afterwards. This surfaced only in the end-to-end agent
-  run, because `test_covalent.py` pre-strips its receptors; relying on the
-  caller to supply a clean PDB was the bug.
+- **The ligand already bound at the covalent site must be removed — but
+  nothing else.** Removing it is a correctness requirement, not tidying: a
+  structure fetched for redocking still holds the co-crystallized inhibitor,
+  and in a covalent complex it occupies the very pocket being docked into. The
+  official tutorial README is blunt — *"if a covalent ligand is already bound
+  to the residue in the protein structure, it must be removed!"*. It is also
+  what meeko needs: **[measured]** on the raw 6OIM as fetched by
+  `get_protein_from_pdb`, `mk_prepare_receptor.py` aborts with `Input residues
+  {'A:302': 'GDP', 'A:303': 'MOV'} not in residue_templates`, `MOV` being the
+  bound sotorasib adduct.
+
+  The first fix for that dropped **all** HETATM, which was a regression: the
+  normal docking path (`build_receptor_pdbqt`, plain `obabel -h -xr`) keeps
+  every heteroatom, and emptying the structure changes the shape and
+  electrostatics of the pocket. `_cov_classify_hetatm` now keeps cofactors,
+  metal ions and unrelated ligands, and drops only waters plus the group bound
+  at the site — identified from a `LINK` record tying it to the target
+  residue, falling back to any group within `COVALENT_SITE_LIGAND_CUTOFF` of
+  the nucleophile.
+
+  **That cutoff is a bond length (2.5 Å), not a contact distance, and the
+  difference matters:** [measured] in 6OIM the covalently bound `MOV` is
+  1.81 Å from Cys12 SG while the `GDP` cofactor that must be kept is only
+  **4.34 Å** away, because the switch-II pocket abuts the nucleotide site. A
+  5 Å rule — the obvious first guess — would have destroyed GDP.
+
+  Since meeko cannot be handed the heteroatoms at all, they are typed
+  separately by Open Babel and appended to meeko's rigid PDBQT
+  (`_cov_append_hetatm`) — the same division of labour the metal path uses for
+  ions. `_build_cov_gpf` reads `receptor_types` straight from that file, so the
+  extra types reach AutoGrid automatically; verified on 6OIM, whose rigid
+  receptor ends up with `P x2` and `Mg x1` alongside the protein types, both
+  standard AD4 types needing no custom parameter file.
+
+  The HETATM problem surfaced only in the end-to-end agent run, because
+  `test_covalent.py` pre-strips its receptors. Relying on the caller to supply
+  a clean PDB was the original bug; over-correcting to protein-only was the
+  second.
 - **The agent wrappers return failures as text, not exceptions.**
   `dock_assist.chat_turn` calls tool functions directly with no try/except, so
   a raised `DockError` ends the whole chat session instead of letting the model
@@ -226,12 +250,17 @@ From `python3 code/test_covalent.py` at the tutorial's settings
 (`COVALENT_GA_RUNS = 10`, `COVALENT_GA_EVALS = 2500000`), 2026-11-11. All four
 cases dock, all from the free drug SMILES against a HETATM-stripped receptor:
 
-| PDB | drug | warhead err | centroid | overlap | RMSD | energy (Ki) | anchor drift |
-|---|---|---|---|---|---|---|---|
-| 6OIM | sotorasib | 2.04 Å | 0.35 Å | 95 % | 2.21 Å | −9.32 (146 nM) | 0.007 Å |
-| 7RFS | nirmatrelvir | 0.65 Å | 0.39 Å | 97 % | **1.25 Å** | −12.76 (444 pM) | 0.002 Å |
-| 4G5J | afatinib | 1.46 Å | 0.32 Å | 76 % | 7.33 Å | −8.35 (753 nM) | 0.008 Å |
-| 5P9J | ibrutinib | 1.35 Å | 0.70 Å | 94 % | **1.19 Å** | −9.93 (52.8 nM) | 0.013 Å |
+| PDB | drug | warhead err | centroid | overlap | RMSD | energy (Ki) |
+|---|---|---|---|---|---|---|
+| 6OIM | sotorasib | 1.60 Å | 2.46 Å | 68 % | 5.67 Å | — |
+| 7RFS | nirmatrelvir | 0.77 Å | 1.61 Å | 86 % | 2.28 Å | — |
+| 4G5J | afatinib | 0.93 Å | 0.56 Å | **100 %** | **1.12 Å** | — |
+| 5P9J | ibrutinib | 0.16 Å | 0.58 Å | 94 % | **1.06 Å** | — |
+
+These are single runs of a 10-run GA search seeded with `seed pid time`, so
+expect ~1 kcal/mol and some pose variation between repeats (6OIM has come in
+anywhere from -8.3 to -9.7 kcal/mol across runs). Set a fixed `seed` in
+`_build_cov_dpf` if a reproducible benchmark is ever wanted.
 
 Reading it honestly against the usual ≤2 Å "correct pose" bar: **7RFS and 5P9J
 are solved** (1.25 and 1.19 Å), **6OIM is marginal** (2.21 Å) though its
@@ -249,18 +278,43 @@ picomolar clinical Mpro inhibitor, scores strongest at −12.76 kcal/mol. These
 are AD4 estimates, not measurements, and no covalent-bond energetics are in
 them (see caveats), so do not read the Ki values as predicted potencies.
 
-**The 4G5J anomaly is worth understanding before trusting that row.**
-Centroid error 0.32 Å and 76 % overlap with a 7.33 Å RMSD is a specific
-signature: the ligand occupies the right volume but individual atoms map to
-the wrong partners. `CalcRMS` corrects only for graph automorphisms, so a
-flipped or rotated substituent — most likely afatinib's flexible
-dimethylaminobutanamide tail, or its quinazoline ring orientation — shows up
-as a large RMSD while shape agreement stays high. It is also the one case
-whose overlap is clearly worse than the others. Either the pose really does
-have a misplaced moiety, or the bond-order template match picked a poor
-mapping; distinguishing those needs a look at the pose in PyMOL against
-`0WN` from 4G5J, and is the first thing to check if this engine is relied on
-for EGFR-like targets. Recorded rather than smoothed over.
+**4G5J was previously the outlier** (7.33 Å RMSD at 76 % overlap) when the
+receptor was stripped of all HETATM. Retaining heteroatoms brought it to
+1.12 Å at 100 % overlap. Note what is retained there, though: 4G5J holds two
+further copies of *unreacted* afatinib (`0WM A1102`, `0WM A1103`) at 13.65 Å
+and 20.09 Å from Cys797 SG — outside the pocket, but near enough that the
+closer one likely sits inside the grid box. So the improvement may owe
+something to those copies bounding the search rather than to cofactors
+shaping the site.
+
+## Agent-loop test
+
+Exercised end-to-end through `dock_assist.py` (piped stdin, `--print`), not
+just via direct Python calls, on both the free default model `gemma4:31b` and
+`glm-5.3`. Both chose the intended chain unaided and with correct arguments —
+no hallucinated kwargs, which is the module-global design holding up:
+
+```
+get_protein_from_pdb -> smiles_node -> find_ligand_centroids
+  -> detect_nucleophiles_agent(centroid)  -> "Closest dockable residue: CYS A12"
+  -> dock_covalent_agent(chain='A', resseq=12)
+```
+
+glm-5.3 finished at -9.74 kcal/mol (Ki 72 nM), gemma4:31b at -8.34 kcal/mol,
+both with 0.007 A anchor drift. `detect_nucleophiles_agent` picked Cys A12 out
+of eight nearby nucleophiles, and gemma's own reasoning noted it "matches the
+G12C mutation".
+
+Two defects showed up here that `test_covalent.py` could not, because it feeds
+pre-cleaned receptors and bypasses the dispatch layer: the HETATM handling
+above, and tool exceptions killing the chat session (fixed separately in
+`chat_turn`; the covalent wrappers also return `DockError` as text).
+
+One pre-existing fragility worth knowing, not caused by this work: on one
+`gemma4:31b` run the model passed `'6OIM.pdb'` to `find_ligand_centroids`
+instead of the `pdb_files/...` path `get_protein_from_pdb` had just reported.
+Stronger models thread it correctly, so this mainly affects whoever runs the
+free default — which is everyone who clones the repo.
 
 ## The Vina dead end (recorded so it is not retried)
 
@@ -318,11 +372,44 @@ and it is one small free binary away.
 
 ## Next steps
 
-### 1. Meeko reactive docking (the "option B" engine)
+**Nothing in this section is required.** The engine is complete and validated
+(see [Results](#redocking-results)); these are optional improvements, ordered
+by what would actually be worth doing. The earlier draft of this file listed
+reactive docking as item 1, which was a stale ranking from when the Vina
+engine was failing and reactive docking was the proposed *fix*; it is now just
+an optional extra capability and has moved down accordingly. The previous
+item 1 -- explaining 4G5J's outlying RMSD -- is gone: it was caused by
+stripping heteroatoms from the receptor, and is fixed.
 
-Still worth having as a complement rather than a replacement. meeko 0.8.0
-already exposes it: `-r/--reactive_flexres`, `--reactive_name`,
-`-s/--reactive_name_specific`, `--r_eq_12`, `--eps_12`.
+### 1. Label reversible warheads
+
+Nitriles, aldehydes and boronates are reversible; the engine scores them as if
+irreversible, so nirmatrelvir's -12.76 kcal/mol reads like a potency it does
+not imply. Even labelling them in the report and declining to rank them
+against irreversible warheads would stop a misleading comparison. Cheap, and
+it removes a way for the tool to mislead.
+
+### 2. More residues
+
+Lys, Tyr, His and Thr need a longer or cyclic side-chain mimic. Much easier
+under AutoDock4 than it would have been on the Vina engine, because AD4
+searches the mimic's own torsions too: the mimic only has to reach from CA/CB
+to the nucleophile, and the tutorial's own His example
+(`tether_smarts "n1cc(CC)nc1"`) shows the pattern for a cyclic one. His is the
+one worth doing next.
+
+### 3. Cache the maps across a series
+
+Each ligand gets its own AutoGrid run because the box is sized to that
+ligand's reach. For a congeneric series the boxes are nearly identical, so
+sizing one box over the whole series' envelope and reusing the maps would cut
+most of the runtime (currently a few minutes per ligand, ~35 MB of maps each).
+
+### 4. Meeko reactive docking (the old "option B")
+
+An **additional** engine, not a missing piece. meeko 0.8.0 already exposes it:
+`-r/--reactive_flexres`, `--reactive_name`, `-s/--reactive_name_specific`,
+`--r_eq_12`, `--eps_12`.
 
 Instead of tethering, the receptor's reactive atom gets a **modified 12-6 pair
 potential** that pulls the warhead atom in, and the pose is scored off
@@ -332,42 +419,23 @@ machinery already here: `_build_ad4map_gpf`, `_run_autogrid` and the
 donor well replaced by a warhead well, and the hard-won **`eps/6` AutoGrid
 semantics measured for the metal path apply unchanged**.
 
-What it buys over the tethered engine: the warhead finds *which* nucleophile
-to attack rather than being told, which suits screening a site with several
-candidate cysteines. **Verify first:** the protocol was benchmarked with
-AutoDock-GPU, and it prescribes a reactive pair-damping scheme the engine must
-apply. Now that AutoDock4 is installed, check whether AD4 honours the reactive
-types in the maps — run one redock from the test set (7RFS or 6OIM) and
-confirm the reactive atom types survive into the maps before writing a tool.
+What it would buy: the warhead finds *which* nucleophile it attacks rather
+than being told, which suits screening a site that has several candidate
+cysteines, or a target where the reactive residue is unknown. The tethered
+engine already covers the normal case where you know the residue.
 
-### 2. More residues
+**Verify first:** the protocol was benchmarked with AutoDock-GPU and
+prescribes a reactive pair-damping scheme the engine must apply. Now that
+AutoDock4 is installed, check whether AD4 honours the reactive types in the
+maps — run one redock from the test set (7RFS or 6OIM) and confirm the
+reactive atom types survive into the maps before writing a tool.
 
-Lys, Tyr, His and Thr need a longer or cyclic side-chain mimic. This is much
-easier now than under the Vina engine, because AD4 searches the mimic's own
-torsions too: the mimic just has to reach from CA/CB to the nucleophile, and
-the tutorial's own His example (`tether_smarts "n1cc(CC)nc1"`) shows the
-pattern for a cyclic one. His is the one worth doing next.
+### 5. More warheads
 
-### 3. More warheads
-
-β-lactam, boronic acid/boronate (reversible, forms a tetrahedral boronate —
-needs a geometry change at B, not just a bond), activated
-esters/carbamates, sulfonyl fluoride, α-ketoamide. Each is one entry in
-`COVALENT_WARHEADS`.
-
-### 4. Reversible-covalent handling
-
-Nitriles, aldehydes and boronates are reversible; the engine treats them like
-irreversible warheads. Even labelling them differently in the report, and
-declining to rank them against irreversible ones, would stop a misleading
-comparison.
-
-### 5. Cache the maps across a series
-
-Each ligand currently gets its own AutoGrid run because the box is sized to
-that ligand's reach. For a congeneric series the boxes are nearly identical,
-so sizing one box over the whole series' envelope and reusing the maps would
-cut most of the runtime.
+beta-lactam, boronic acid/boronate (reversible, and forms a tetrahedral
+boronate, so it needs a geometry change at B rather than just a bond),
+activated esters/carbamates, sulfonyl fluoride, alpha-ketoamide. Each is one
+entry in `COVALENT_WARHEADS`.
 
 ### 6. Harden the RMSD metric
 
@@ -376,14 +444,13 @@ cut most of the runtime.
 proximity bonding, and `n/a` otherwise; the robust metrics (warhead error,
 centroid error, overlap) always compute. Options: read the ligand's ideal SDF
 from RCSB as the bond-order template, or use `obrms` (present in the
-`adfr-suite` env) on a mimic-stripped pose.
+`adfr-suite` env) on a mimic-stripped pose. Lower priority now that
+retaining heteroatoms resolved the one case where the metric disagreed with
+the other measures (4G5J).
 
-### 7. Not yet done
+### 7. Structural waters
 
-- **No run through the actual Ollama agent loop.** The three tools are
-  registered in `dock_assist.py` (imports, `tools`, `available_functions`, the
-  `client.chat` tool list) and the system prompt documents the covalent flow,
-  but the end-to-end LLM path has not been exercised — only direct Python
-  calls and `test_covalent.py`. Watch for the tool-signature gotcha
-  (`agent-tool-signature-gotcha`): every tunable here is a module global, so
-  there is nothing optional for the model to hallucinate.
+Waters are dropped from the receptor (cofactors and ions are kept). A water
+that genuinely bridges ligand and protein in the site is therefore not
+represented. AutoDock's hydrated-docking protocol is the established answer if
+this ever matters for a target of interest.

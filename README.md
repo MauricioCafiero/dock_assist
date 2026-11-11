@@ -480,19 +480,19 @@ SMILES, each with a crystallographic `LINK` record as ground truth and all
 HETATMs stripped from the receptor, so the crystal ligand cannot bias the
 result. Metrics are in the crystal's own frame with no superposition:
 
-| PDB | target + drug | centroid | overlap | RMSD | energy (Ki) | anchor drift |
-|---|---|---|---|---|---|---|
-| 6OIM | KRAS G12C + sotorasib | 0.35 Å | 95 % | 2.21 Å | −9.32 (146 nM) | 0.007 Å |
-| 7RFS | Mpro + nirmatrelvir | 0.39 Å | 97 % | 1.25 Å | −12.76 (444 pM) | 0.002 Å |
-| 4G5J | EGFR + afatinib | 0.32 Å | 76 % | 7.33 Å | −8.35 (753 nM) | 0.008 Å |
-| 5P9J | BTK + ibrutinib | 0.70 Å | 94 % | 1.19 Å | −9.93 (52.8 nM) | 0.013 Å |
+| PDB | target + drug | centroid | overlap | RMSD | anchor drift |
+|---|---|---|---|---|---|
+| 6OIM | KRAS G12C + sotorasib | 2.46 Å | 68 % | 5.67 Å | 0.007 Å |
+| 7RFS | Mpro + nirmatrelvir | 1.61 Å | 86 % | 2.28 Å | 0.002 Å |
+| 4G5J | EGFR + afatinib | 0.56 Å | 100 % | 1.12 Å | 0.008 Å |
+| 5P9J | BTK + ibrutinib | 0.58 Å | 94 % | 1.06 Å | 0.013 Å |
 
-Against the usual ≤2 Å "correct pose" bar, **7RFS and 5P9J are solved**, 6OIM
-is marginal at 2.21 Å with the placement clearly right, and **4G5J is only
-partially right**: the ligand sits in the right volume (0.32 Å centroid) but a
-substituent is evidently mis-oriented, which is what the high RMSD against a
-low centroid error means. Anchor drift stays at 0.002–0.013 Å throughout — the
-covalent attachment always holds. Run the suite with
+Against the usual ≤2 Å "correct pose" bar, **4G5J, 5P9J and 7RFS land at or
+near it** (1.12, 1.06 and 2.28 Å) while 6OIM is looser at 5.67 Å despite
+placing the warhead 1.60 Å from its crystal position — the tether fixes the
+attachment, so the spread is in how the rest of the ligand is arranged. Anchor
+drift stays at 0.002–0.013 Å throughout, so the covalent bond always holds.
+These are single GA runs and vary somewhat between repeats. Run the suite with
 `python3 code/test_covalent.py`.
 
 **Caveats, in plain terms:**
@@ -505,6 +505,13 @@ covalent attachment always holds. Run the suite with
   reality but are treated like irreversible warheads.
 - **Rigid receptor** apart from the removed target side chain, so an inhibitor
   needing induced fit will score badly.
+- **Receptor prep keeps cofactors.** Cofactors, metal ions and unrelated
+  ligands are retained in the receptor; **waters are dropped**, and so is
+  whatever ligand is already bound at the target residue — that last one is
+  mandatory, since in a covalent complex it sits in the pocket you are docking
+  into. It is identified from the structure's `LINK` record, falling back to a
+  2.5 Å bond-length test against the nucleophile. So a structural water in the
+  site is not represented, but a cofactor that shapes the site is.
 - **A few minutes per ligand** — each one gets fresh AutoGrid maps and a full
   search, so keep the SMILES list short.
 

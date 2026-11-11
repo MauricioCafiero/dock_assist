@@ -1749,6 +1749,14 @@ COVALENT_GA_EVALS = 2500000
 # ([measured] 0.007 A); the check exists to catch a broken setup, not to filter
 # poses.
 COVALENT_ANCHOR_DRIFT_WARN = 0.25
+# A HETATM group counts as "already bound at the covalent site" -- and is the
+# one thing that must be removed -- when a LINK record ties it to the target
+# residue, or when it has an atom within this distance of the nucleophile.
+# This is a BOND length, not a contact distance, and deliberately so:
+# [measured] in 6OIM the covalently bound MOV sits 1.81 A from Cys12 SG while
+# the GDP cofactor that must be KEPT is only 4.34 A away (the switch-II pocket
+# abuts the nucleotide site), so a 5 A rule would destroy it.
+COVALENT_SITE_LIGAND_CUTOFF = 2.5
 # [measured] Each anchored conformer is scored by its own single-ligand Vina
 # call with --autobox, which sizes the grid to that one pose (~0.5 s, so a
 # default ensemble costs ~75 s per ligand). Two cheaper-looking alternatives
@@ -2015,16 +2023,133 @@ def _build_covalent_adduct(smiles, resname):
                     f"warheads are: {known}")
 
 
+def _cov_classify_hetatm(pdb_path, chain, resseq, nuc_xyz):
+    """Which HETATM groups a covalent-docking receptor should keep.
+
+    Cofactors, metal ions and unrelated ligands are KEPT. The normal docking
+    path (build_receptor_pdbqt) keeps every HETATM, and emptying the structure
+    changes the shape and electrostatics of the pocket, so dropping them
+    wholesale would be a regression against the rest of this module.
+
+    Only two things are dropped:
+      * waters;
+      * whatever is already bound at the covalent site, which MUST go because
+        it occupies the pocket being docked into -- the official protocol is
+        explicit ("if a covalent ligand is already bound to the residue in the
+        protein structure, it must be removed!"). It is identified from a LINK
+        record tying a HETATM group to the target residue, falling back to any
+        group with an atom within COVALENT_SITE_LIGAND_CUTOFF of the
+        nucleophile for structures that carry no LINK record.
+
+    Returns (kept HETATM lines, summary string describing what was dropped).
+    """
+    # Normalise here rather than trusting the caller: residue numbers parsed
+    # out of a PDB are strings, and comparing them against an int resseq fails
+    # silently -- the LINK match just never fires and the distance fallback
+    # quietly takes over, which looks like it worked. dock_covalent already
+    # str()s its arguments; a direct caller (a test, a notebook) may not.
+    chain = (chain or "").strip()
+    resseq = str(resseq).strip()
+    linked = set()
+    groups = {}   # (resname, chain, resseq) -> [lines]
+    coords = {}   # same key -> [xyz]
+    with open(pdb_path) as fh:
+        for line in fh:
+            if line.startswith("LINK"):
+                # PDB spec: resName1/chainID1/resSeq1 at cols 18-20/22/23-26,
+                # resName2/chainID2/resSeq2 at cols 48-50/52/53-56 (1-based)
+                a = (line[17:20].strip(), line[21], line[22:26].strip())
+                b = (line[47:50].strip(), line[51], line[52:56].strip())
+                if (a[1], a[2]) == (chain, resseq):
+                    linked.add(b)
+                elif (b[1], b[2]) == (chain, resseq):
+                    linked.add(a)
+            elif line.startswith("HETATM"):
+                key = (line[17:20].strip(), line[21], line[22:26].strip())
+                groups.setdefault(key, []).append(line)
+                try:
+                    coords.setdefault(key, []).append(
+                        (float(line[30:38]), float(line[38:46]),
+                         float(line[46:54])))
+                except ValueError:
+                    pass
+
+    kept, dropped_site, n_water = [], [], 0
+    for key, lines in groups.items():
+        resname = key[0]
+        if resname == "HOH":
+            n_water += len(lines)
+            continue
+        near = min((math.dist(x, nuc_xyz) for x in coords.get(key, ())),
+                   default=float("inf"))
+        if key in linked or near <= COVALENT_SITE_LIGAND_CUTOFF:
+            why = "LINK to target" if key in linked else f"{near:.2f} A away"
+            dropped_site.append(f"{resname} {key[1]}{key[2]} ({why})")
+            continue
+        kept.append((key, lines))
+
+    kept.sort(key=lambda t: (t[0][1], t[0][2]))
+    kept_lines = [l for _k, ls in kept for l in ls]
+    parts = []
+    if kept:
+        parts.append("kept " + ", ".join(f"{k[0]} {k[1]}{k[2]}" for k, _ in kept))
+    if dropped_site:
+        parts.append("removed site ligand " + ", ".join(dropped_site))
+    if n_water:
+        parts.append(f"dropped {n_water} water atoms")
+    return kept_lines, "; ".join(parts) if parts else "no HETATM present"
+
+
+def _cov_append_hetatm(rigid_pdbqt, het_lines, out_root):
+    """Type the kept HETATMs with Open Babel and append them to the rigid PDBQT.
+
+    They cannot simply be left in meeko's input: [measured] meeko aborts on any
+    residue it has no template for ("Input residues {'A:302': 'GDP', 'A:303':
+    'MOV'} not in residue_templates"), and meeko is needed for the
+    flexible-residue split. So the protein goes through meeko and the
+    heteroatoms are typed separately and appended -- the same division of
+    labour the metal path uses for ions (build_receptor_pdbqt_with_metals).
+    _build_cov_gpf reads receptor_types straight out of this file, so the extra
+    atom types reach AutoGrid automatically.
+    """
+    tmp_pdb = out_root + "_cofactor.pdb"
+    tmp_pdbqt = out_root + "_cofactor.pdbqt"
+    try:
+        with open(tmp_pdb, "w") as fh:
+            fh.writelines(het_lines)
+            fh.write("END\n")
+        convert(["obabel", "-ipdb", tmp_pdb, "-h", "-opdbqt", "-xr",
+                 "-O", tmp_pdbqt], "cofactor PDB->PDBQT")
+        with open(tmp_pdbqt) as fh:
+            add = [l for l in fh if l.startswith(("ATOM", "HETATM"))]
+        if not add:
+            raise DockError(f"Open Babel typed no cofactor atoms from "
+                            f"{len(het_lines)} HETATM records")
+        with open(rigid_pdbqt, "a") as fh:
+            fh.writelines(add)
+        return len(add)
+    finally:
+        for p in (tmp_pdb, tmp_pdbqt):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+
+
 def _cov_rigid_receptor(pdb_path, chain, resseq, out_root, anchor,
                         overwrite=False):
-    """Rigid receptor PDBQT with the target residue's side chain removed.
+    """Rigid receptor PDBQT: target side chain removed, cofactors retained.
 
     Runs meeko's mk_prepare_receptor.py with the target residue declared
     FLEXIBLE (-f <chain>:<resnum>), which moves CA/CB/side chain out of the
     rigid file; the companion _flex.pdbqt it writes holds the residue's OWN
     side chain and is deliberately discarded, because the covalent adduct
-    takes its place as the flexible residue. Returns the rigid PDBQT path,
-    cached across ligands.
+    takes its place as the flexible residue.
+
+    meeko only ever sees the protein (see _cov_append_hetatm); cofactors and
+    metal ions are typed separately and appended afterwards, and the ligand
+    already bound at the covalent site is removed (see _cov_classify_hetatm).
+    The result is cached across ligands.
     """
     script = _meeko_script("mk_prepare_receptor.py")
     if script is None:
@@ -2034,28 +2159,16 @@ def _cov_rigid_receptor(pdb_path, chain, resseq, out_root, anchor,
     if os.path.exists(rigid) and not overwrite:
         return rigid
 
-    # Strip every HETATM first. This is NOT just tidying: a structure fetched
-    # for redocking still contains the co-crystallized inhibitor, and for a
-    # covalent complex that ligand sits in the very pocket being docked into,
-    # so leaving it in makes the result meaningless. The official tutorial is
-    # explicit -- "if a covalent ligand is already bound to the residue in the
-    # protein structure, it must be removed!". It also happens to be what
-    # meeko needs: [measured] on the raw 6OIM it aborts with "Input residues
-    # {'A:302': 'GDP', 'A:303': 'MOV'} not in residue_templates", MOV being
-    # the bound sotorasib adduct itself.
-    # Waters and cofactors go too (GDP/Mg here), which is the honest
-    # limitation: a cofactor that genuinely shapes the site is not represented.
-    # All protein chains are kept, since a neighbouring chain can form part of
-    # the pocket.
+    keep_het, het_summary = _cov_classify_hetatm(
+        pdb_path, chain, resseq, [float(v) for v in anchor[2]])
+
     protein_pdb = out_root + "_protein.pdb"
-    n_atom = n_het = 0
+    n_atom = 0
     with open(pdb_path) as src, open(protein_pdb, "w") as dst:
         for line in src:
             if line.startswith("ATOM"):
                 dst.write(line)
                 n_atom += 1
-            elif line.startswith("HETATM"):
-                n_het += 1
             elif line.startswith(("TER", "END")):
                 dst.write(line)
     if n_atom == 0:
@@ -2064,8 +2177,9 @@ def _cov_rigid_receptor(pdb_path, chain, resseq, out_root, anchor,
         except OSError:
             pass
         raise DockError(f"no ATOM (protein) records in {pdb_path}")
-    print(f"vina_dock: covalent receptor prep: kept {n_atom} protein atoms, "
-          f"dropped {n_het} HETATM (ligands/waters/cofactors)")
+    print(f"vina_dock: covalent receptor: {n_atom} protein atoms; "
+          f"HETATM: {het_summary}")
+
     # --default_altloc A: [measured] meeko refuses any structure containing a
     # residue with alternate locations ("Error: Creation of data structure for
     # receptor failed ... Residues with alternate location"), common in
@@ -2076,15 +2190,15 @@ def _cov_rigid_receptor(pdb_path, chain, resseq, out_root, anchor,
     # incomplete side chains; this drops those residues instead. Safe here
     # only because _residue_anchor validates the TARGET residue against the
     # PDB beforehand, so a truncated target is reported rather than silently
-    # deleted -- but the rigid receptor can be missing odd surface residues.
+    # deleted.
     # meeko's -f takes "<chain>:<resnum>", NOT the "<chain>:<resname>:<resnum>"
     # spelling the covalent ligand path wants (see the module comment above).
     try:
         _run([sys.executable, script, "-i", protein_pdb, "-o", out_root, "-p",
               "-f", f"{chain}:{resseq}",
               "--default_altloc", "A", "--allow_bad_res",
-              "--box_center", f"{anchor[0]:.3f}", f"{anchor[1]:.3f}",
-              f"{anchor[2]:.3f}",
+              "--box_center", f"{anchor[1][0]:.3f}", f"{anchor[1][1]:.3f}",
+              f"{anchor[1][2]:.3f}",
               "--box_size", "30", "30", "30"],
              f"meeko receptor prep (flexres {chain}:{resseq})")
     finally:
@@ -2094,10 +2208,17 @@ def _cov_rigid_receptor(pdb_path, chain, resseq, out_root, anchor,
             pass
     if not os.path.exists(rigid):
         raise DockError(f"meeko wrote no rigid receptor PDBQT: {rigid}")
+    # Drop the companion _flex.pdbqt: the tethered adduct takes the side
+    # chain's place, so leaving it behind would only look like it mattered
+    # (same reason the AD4Zn path prunes meeko's stray side files).
     try:
         os.remove(out_root + "_flex.pdbqt")
     except OSError:
         pass
+    if keep_het:
+        n_add = _cov_append_hetatm(rigid, keep_het, out_root)
+        print(f"vina_dock: appended {n_add} cofactor/ion atoms to the rigid "
+              f"receptor")
     return rigid
 
 
@@ -2510,7 +2631,7 @@ def dock_covalent(receptor_pdb, smiles_list, chain, resseq, ga_runs=None,
 
         rec_root = f"{stem}_cov{chain}{resseq}"
         rec_rigid = _cov_rigid_receptor(receptor_pdb, chain, resseq, rec_root,
-                                        anchor[1], overwrite=overwrite_receptor)
+                                        anchor, overwrite=overwrite_receptor)
         work = tempfile.mkdtemp(prefix="dock_cov_")
         try:
             # AD4/AutoGrid reference their inputs by basename, so everything

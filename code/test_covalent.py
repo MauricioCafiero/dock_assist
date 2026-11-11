@@ -201,7 +201,14 @@ def pose_metrics(pose_sdf, resname, lig_ref, link_ref):
 
 def run_case(case, ga_runs):
     pid, chain, resseq, drug, smiles, het, link_atom, bond = case
-    prot = os.path.join(TESTDIR, f"{pid}_prot.pdb")
+    # Dock against the RAW PDB, not the protein-only copy. The engine does its
+    # own HETATM handling (keep cofactors and ions, drop waters and the ligand
+    # bound at the covalent site), so feeding it a pre-stripped receptor would
+    # bypass exactly the code that needs testing -- and would not match what
+    # the agent passes in, which is whatever get_protein_from_pdb fetched.
+    # Each of the four cases carries a LINK record to its target residue, so
+    # this also checks the LINK-based removal of the bound adduct.
+    prot = os.path.join(TESTDIR, f"{pid}.pdb")
     print(f"\n{'=' * 72}\n{pid}  {drug}  ->  Cys {chain}{resseq}   "
           f"(crystal SG-{link_atom} = {bond:.2f} A)\n{'=' * 72}")
     anchor, lig_ref, link_ref = crystal_reference(pid, chain, resseq, het,
